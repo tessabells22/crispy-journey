@@ -203,7 +203,7 @@ function setProp_(k, v) { PropertiesService.getScriptProperties().setProperty(k,
 function slackApi_(method, params) {
   var token = prop_('SLACK_USER_TOKEN');
   if (!token) throw new Error('SLACK_USER_TOKEN is not set in Script Properties.');
-  var qs = Object.keys(params || {}).map(function (k) {
+  var qs = Object.keys(params || {}).filter(function (k) { return params[k] != null && params[k] !== ''; }).map(function (k) {
     return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
   }).join('&');
   for (var attempt = 0; attempt < 3; attempt++) {
@@ -263,14 +263,15 @@ function messageText_(msg) {
 function tsToIso_(ts) { return new Date(Number(ts) * 1000).toISOString(); }
 
 /* Fetch posts since `oldestTs`, parse them, pull assignee replies, upsert. */
-function syncSince_(oldestTs) {
+function syncSince_(oldestTs, opts) {
+  opts = opts || {};
   var channel = prop_('SLACK_CHANNEL_ID');
   if (!channel) throw new Error('SLACK_CHANNEL_ID is not set in Script Properties.');
 
   var messages = [], cursor = '';
   do {
     var page = slackApi_('conversations.history', {
-      channel: channel, oldest: String(oldestTs), limit: 200, cursor: cursor
+      channel: channel, oldest: String(oldestTs), latest: opts.latest ? String(opts.latest) : undefined, limit: 200, cursor: cursor
     });
     messages = messages.concat(page.messages || []);
     cursor = (page.response_metadata && page.response_metadata.next_cursor) || '';
@@ -283,7 +284,7 @@ function syncSince_(oldestTs) {
     var text = messageText_(msg);
     var ids = mentionIds_(text);
     var replies = [];
-    if (msg.reply_count) {
+    if (msg.reply_count && !opts.noReplies) {
       try {
         replies = (slackApi_('conversations.replies', { channel: channel, ts: msg.ts, limit: 100 }).messages || [])
           .filter(function (r) { return r.ts !== msg.ts; })
@@ -444,8 +445,14 @@ function importEndorsementHistory() {
 /* Pull older AXOs from Slack so the import above can match them, then close
    the newly added ones that are overdue and have no QA history. */
 function backfillForImport() {
-  var started = nowIso_();
-  backfillSlack(Number(prop_('IMPORT_BACKFILL_DAYS') || 75));
+  var started = nowIso_(), now = Date.now() / 1000;
+  // Only the older stretch the 30-day import didn't cover, and without thread
+  // replies: Slack rate-limits those, and one call per post would not finish
+  // inside Apps Script's 6-minute limit. Dev assignees on these old AXOs stay blank.
+  var lastTs = prop_('SLACK_LAST_TS');
+  var r0 = syncSince_(now - Number(prop_('IMPORT_BACKFILL_DAYS') || 75) * 86400, { latest: now - 28 * 86400, noReplies: true });
+  if (lastTs) setProp_('SLACK_LAST_TS', lastTs);
+  console.log('older backfill: added ' + r0.added.length + ', updated ' + r0.updated.length);
   var r = importEndorsementHistory();
   var n = closeImportedAxos('', false, started);
   console.log('Closed ' + n + ' newly backfilled AXOs that are overdue with no QA history.');
