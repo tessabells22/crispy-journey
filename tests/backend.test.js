@@ -92,4 +92,16 @@ t('re-sync never reopens a closed AXO', () => {
   assert.strictEqual(plain(g.ctx.apiBootstrap()).axos[0].state, 'Closed');
 });
 
+t('closeImportedAxos closes overdue untouched AXOs only', () => {
+  const g = loadGas();
+  g.ctx.apiPasteAxo('Axo Number: 1001 - Old\nDue Date: 2020-01-01');
+  g.ctx.apiPasteAxo('Axo Number: 1002 - Old but worked\nDue Date: 2020-01-01');
+  g.ctx.apiPasteAxo('Axo Number: 1003 - Future\nDue Date: 2099-01-01');
+  g.ctx.apiAddUpdate({ axoNumber: '1002', qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status: 'In Progress', notes: '', files: [] });
+  assert.strictEqual(g.ctx.closeImportedAxos('2026-11-14'), 1);
+  const st = Object.fromEntries(plain(g.ctx.apiBootstrap()).axos.map(a => [a.axoNumber, a.state]));
+  assert.deepStrictEqual(st, { '1001': 'Closed', '1002': 'Active', '1003': 'Active' });
+  assert.strictEqual(g.ctx.closeAllImportedAxos(), 1);
+});
+
 console.log(n + ' tests passed');

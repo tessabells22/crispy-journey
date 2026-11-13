@@ -340,6 +340,27 @@ function backfillSlack(days) {
   return r;
 }
 
+/* One-time cleanup after a backfill: closes active AXOs with no QA update
+   whose due date is before `beforeIso` (default: today in Manila), or every
+   such AXO when `all` is true. Reversible with Reopen in the web app. */
+function closeImportedAxos(beforeIso, all) {
+  var cutoff = beforeIso || Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  var touched = {};
+  readRows_(UPDATE_SHEET, UPDATE_HEADERS).forEach(function (u) { touched[u.AxoNumber] = true; });
+  var sh = sheet_(AXO_SHEET, AXO_HEADERS), now = nowIso_(), n = 0;
+  readRows_(AXO_SHEET, AXO_HEADERS).forEach(function (r) {
+    if ((r.State || 'Active') !== 'Active' || touched[r.AxoNumber]) return;
+    if (!all && !(r.DueDate && r.DueDate < cutoff)) return;
+    sh.getRange(r._row, AXO_HEADERS.indexOf('State') + 1).setValue('Closed');
+    sh.getRange(r._row, AXO_HEADERS.indexOf('ClosedAt') + 1).setValue(now);
+    sh.getRange(r._row, AXO_HEADERS.indexOf('UpdatedAt') + 1).setValue(now);
+    n++;
+  });
+  console.log('Closed ' + n + ' AXOs' + (all ? '' : ' due before ' + cutoff) + '.');
+  return n;
+}
+function closeAllImportedAxos() { return closeImportedAxos('', true); }
+
 /* Run once from the editor: installs a 5-minute syncSlack trigger. */
 function setupSlackSync() {
   ScriptApp.getProjectTriggers().forEach(function (t) {

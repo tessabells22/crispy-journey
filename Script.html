@@ -109,6 +109,7 @@
     if (/^(low|p3|p4)/.test(s)) return 'Low';
     return '';
   }
+  function shortPrio(p) { var w = String(p || '').trim().split(/[\s(]/)[0]; return w || String(p || ''); }
   var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };
 
   /* ---------- derive ---------- */
@@ -272,7 +273,7 @@
         var dh = dueHtml(a); if (dh) meta.push(dh);
         var note = a.latest && a.latest.notes ? '<div class="c-note"><b>' + esc(a.latest.qa) + ':</b> ' + esc(a.latest.notes) + '</div>' : '';
         return '<article class="card' + (a.closed ? ' closed' : '') + '" data-open="' + esc(a.axoNumber) + '" aria-current="' + (S.open === a.axoNumber) + '" style="--sc:' + (a.status ? sColor(a.status) : 'var(--orange)') + '" tabindex="0">' +
-          '<div class="c-top"><span class="c-num">' + esc(a.axoNumber) + '</span>' + (a.priority ? '<span class="prio ' + a.prio + '">' + esc(a.priority) + '</span>' : '') +
+          '<div class="c-top"><span class="c-num">' + esc(a.axoNumber) + '</span>' + (a.priority ? '<span class="prio ' + a.prio + '" title="' + esc(a.priority) + '">' + esc(shortPrio(a.priority)) + '</span>' : '') +
           statusPill(a.status) + (a.closed ? '<span class="tag closed">Closed</span>' : '') + '</div>' +
           '<div class="c-title">' + esc(a.title || '(no title)') + '</div>' +
           '<div class="c-meta">' + meta.join('') + '</div>' +
