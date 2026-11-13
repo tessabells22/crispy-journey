@@ -8,7 +8,7 @@
   <?!= include('Styles'); ?>
 </head>
 <body>
-  <header class="hero">
+  <div class="topbar" id="topbar">
     <div class="hero-bar">
       <div class="brand">
         <svg width="34" height="28" viewBox="0 0 36 32" role="img" aria-label="ShipERP">
@@ -31,6 +31,8 @@
         <select id="me-select" aria-label="Your name"><option value="">Pick your name</option></select>
       </label>
     </div>
+  </div>
+  <header class="hero">
     <div class="hero-main">
       <div>
         <div class="shift-line"><span class="dot"></span><span id="shift-line">Loading</span></div>
@@ -46,13 +48,17 @@
         <h2>Queues</h2>
         <div class="queues" id="queues"></div>
       </div>
+      <div>
+        <h2>Insights</h2>
+        <div class="queues"><button class="queue" type="button" id="reports-btn" data-queue="reports" aria-current="false" style="--q:var(--brand)"><span class="ic"></span>Reports and workload</button></div>
+      </div>
       <div class="team-wrap">
         <h2>Team</h2>
         <div class="team" id="team"></div>
       </div>
     </nav>
 
-    <main class="board">
+    <main class="board" id="board">
       <div class="board-head">
         <h2 id="board-title">Active</h2>
         <div class="search">
@@ -70,6 +76,25 @@
       </div>
       <div class="cards" id="cards"><div class="loading">Loading…</div></div>
       <div class="foot"><span id="count"></span><span id="build"></span></div>
+    </main>
+
+    <main class="board reports" id="reports" hidden>
+      <div class="board-head">
+        <h2>Reports and QA workload</h2>
+        <select class="tb-sel" id="r-range" aria-label="Date range">
+          <option value="today">Today</option>
+          <option value="week" selected>This week</option>
+          <option value="7">Last 7 days</option>
+          <option value="month">This month</option>
+          <option value="30">Last 30 days</option>
+          <option value="custom">Custom dates</option>
+        </select>
+        <span class="r-custom" id="r-custom" hidden>
+          <input type="date" class="tb-sel" id="r-from" aria-label="From"> to <input type="date" class="tb-sel" id="r-to" aria-label="To">
+        </span>
+        <button class="btn btn-sm" type="button" id="r-copy">Copy as CSV</button>
+      </div>
+      <div id="r-body"></div>
     </main>
 
     <div class="scrim" id="scrim" hidden></div>

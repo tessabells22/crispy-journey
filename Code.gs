@@ -22,7 +22,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-13.1';
+var BUILD = '2026-11-14.1';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
@@ -63,7 +63,7 @@ function onOpen() {
     .addItem('Set up tabs', 'setupSheets')
     .addItem('Test Slack connection', 'testSlackConnection')
     .addItem('Import last 30 days from Slack', 'backfillSlack')
-    .addItem('Start auto-sync (every 5 min)', 'setupSlackSync')
+    .addItem('Start auto-sync (every 3 min)', 'setupSlackSync')
     .addItem('Sync now', 'syncSlack')
     .addToUi();
 }
@@ -102,7 +102,8 @@ function readRows_(name, headers) {
     var o = { _row: i + 2 };
     headers.forEach(function (h, j) {
       var v = row[j];
-      if (Object.prototype.toString.call(v) === '[object Date]') v = Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+      // Timestamp columns (…At) keep their time; date columns become YYYY-MM-DD.
+      if (Object.prototype.toString.call(v) === '[object Date]') v = /At$/.test(h) ? v.toISOString() : Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
       o[h] = v === null || v === undefined ? '' : String(v);
     });
     return o;
@@ -317,6 +318,9 @@ function syncSince_(oldestTs) {
 /* Time-trigger entry point. Re-scans a short window so dev-assignee thread
    replies that arrive after the post are still picked up. */
 function syncSlack() {
+  // Apps Script timers only run every 1/5/10/15/30 min, so the trigger fires
+  // every minute and this skips until SYNC_EVERY_MIN (default 3) has passed.
+  if (!syncDue_()) return;
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return; // a previous run is still going
   lock.releaseLock();
@@ -332,6 +336,15 @@ function syncSlack() {
   }
 }
 
+function syncDue_() {
+  var every = Number(prop_('SYNC_EVERY_MIN') || 3);
+  var last = {};
+  try { last = JSON.parse(prop_('SLACK_LAST_SYNC') || '{}'); } catch (e) {}
+  if (!last.at) return true;
+  // 20 s of slack so a run that lands a few seconds early isn't pushed a whole minute.
+  return Date.now() - new Date(last.at).getTime() >= every * 60000 - 20000;
+}
+
 /* Run once from the editor to import history. Default 30 days. */
 function backfillSlack(days) {
   var d = Number(days) || 30;
@@ -343,13 +356,14 @@ function backfillSlack(days) {
 /* One-time cleanup after a backfill: closes active AXOs with no QA update
    whose due date is before `beforeIso` (default: today in Manila), or every
    such AXO when `all` is true. Reversible with Reopen in the web app. */
-function closeImportedAxos(beforeIso, all) {
+function closeImportedAxos(beforeIso, all, createdAfterIso) {
   var cutoff = beforeIso || Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
   var touched = {};
   readRows_(UPDATE_SHEET, UPDATE_HEADERS).forEach(function (u) { touched[u.AxoNumber] = true; });
   var sh = sheet_(AXO_SHEET, AXO_HEADERS), now = nowIso_(), n = 0;
   readRows_(AXO_SHEET, AXO_HEADERS).forEach(function (r) {
     if ((r.State || 'Active') !== 'Active' || touched[r.AxoNumber]) return;
+    if (createdAfterIso && !(String(r.CreatedAt) > createdAfterIso)) return;
     if (!all && !(r.DueDate && r.DueDate < cutoff)) return;
     sh.getRange(r._row, AXO_HEADERS.indexOf('State') + 1).setValue('Closed');
     sh.getRange(r._row, AXO_HEADERS.indexOf('ClosedAt') + 1).setValue(now);
@@ -361,13 +375,91 @@ function closeImportedAxos(beforeIso, all) {
 }
 function closeAllImportedAxos() { return closeImportedAxos('', true); }
 
-/* Run once from the editor: installs a 5-minute syncSlack trigger. */
+/* ---------- one-time import from the old Endorsement Tracker ----------
+   Reads the old tracker's "Endorsements" sheet (read only: nothing is ever
+   written there) and adds each AXO line as an update on the matching AXO
+   here. Safe to re-run: updates carry stable "legacy-…" ids. Afterwards each
+   touched AXO follows the normal rule: latest status "Passed -
+   Develop/Deployment" closes it, anything else keeps it (or puts it back)
+   in the active list. AXOs the old tracker has but this one doesn't are
+   reported, not created. */
+var OLD_TRACKER_SHEET_ID = '1WSI1MeqS421MSfTvh2HewJtBi9HVMKcib4EHJOCu8s0';
+
+function importEndorsementHistory() {
+  var src = SpreadsheetApp.openById(prop_('OLD_TRACKER_SHEET_ID') || OLD_TRACKER_SHEET_ID).getSheetByName('Endorsements');
+  if (!src) throw new Error('No "Endorsements" tab in the old tracker sheet.');
+  var values = src.getDataRange().getValues().slice(1).map(function (row) {
+    return row.map(function (v, j) {
+      if (Object.prototype.toString.call(v) !== '[object Date]') return v;
+      return j === 1 ? Utilities.formatDate(v, TZ, 'yyyy-MM-dd') : v.toISOString();
+    });
+  });
+  var legacy = legacyUpdatesFrom(values);
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var axoRows = readRows_(AXO_SHEET, AXO_HEADERS), known = {};
+    axoRows.forEach(function (r) { known[r.AxoNumber] = r; });
+    var existing = readRows_(UPDATE_SHEET, UPDATE_HEADERS), have = {};
+    existing.forEach(function (r) { have[r.Id] = true; });
+
+    var add = [], missing = {}, touched = {};
+    legacy.forEach(function (u) {
+      if (have[u.id]) return;
+      if (!known[u.axoNumber]) { missing[u.axoNumber] = true; return; }
+      if (STATUSES.indexOf(u.status) < 0) u.status = 'In Progress';
+      if (SHIFTS.indexOf(u.shift) < 0) u.shift = 'Day';
+      add.push(rowValues_(updateToRow_(u.id, u, u.createdAt || nowIso_(), u.updatedAt || u.createdAt || nowIso_()), UPDATE_HEADERS));
+      touched[u.axoNumber] = true;
+    });
+    if (add.length) {
+      var sh = sheet_(UPDATE_SHEET, UPDATE_HEADERS);
+      sh.getRange(sh.getLastRow() + 1, 1, add.length, UPDATE_HEADERS.length).setNumberFormat('@').setValues(add);
+    }
+
+    var all = readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_), byAxo = {};
+    all.forEach(function (u) { (byAxo[u.axoNumber] = byAxo[u.axoNumber] || []).push(u); });
+    var closed = [], reopened = [];
+    Object.keys(touched).forEach(function (num) {
+      var latest = latestUpdate(byAxo[num]);
+      var want = latest && AUTO_CLOSE_STATUSES.indexOf(latest.status) >= 0 ? 'Closed' : 'Active';
+      var was = known[num].State || 'Active';
+      if (was === want) return;
+      setAxoState_(num, want);
+      (want === 'Closed' ? closed : reopened).push(num);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  var summary = {
+    updatesAdded: add.length, axosTouched: Object.keys(touched).length,
+    closed: closed.length, reopened: reopened.length, notInTracker: Object.keys(missing).sort()
+  };
+  console.log('Imported ' + summary.updatesAdded + ' updates on ' + summary.axosTouched + ' AXOs. Closed ' + summary.closed +
+    ', reopened ' + summary.reopened + '. Not in this tracker (' + summary.notInTracker.length + '): ' + summary.notInTracker.join(', '));
+  return summary;
+}
+
+/* Pull older AXOs from Slack so the import above can match them, then close
+   the newly added ones that are overdue and have no QA history. */
+function backfillForImport() {
+  var started = nowIso_();
+  backfillSlack(Number(prop_('IMPORT_BACKFILL_DAYS') || 75));
+  var r = importEndorsementHistory();
+  var n = closeImportedAxos('', false, started);
+  console.log('Closed ' + n + ' newly backfilled AXOs that are overdue with no QA history.');
+  return r;
+}
+
+/* Run once from the editor: installs the syncSlack trigger (fires every
+   minute; syncSlack itself waits SYNC_EVERY_MIN, default 3, between syncs). */
 function setupSlackSync() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'syncSlack') ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('syncSlack').timeBased().everyMinutes(5).create();
-  console.log('syncSlack trigger installed (every 5 minutes).');
+  ScriptApp.newTrigger('syncSlack').timeBased().everyMinutes(1).create();
+  console.log('syncSlack trigger installed (syncs every ' + (prop_('SYNC_EVERY_MIN') || 3) + ' minutes).');
 }
 
 /* Run once from the editor to check the token and channel. */

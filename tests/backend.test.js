@@ -104,4 +104,40 @@ t('closeImportedAxos closes overdue untouched AXOs only', () => {
   assert.strictEqual(g.ctx.closeAllImportedAxos(), 1);
 });
 
+t('syncSlack waits SYNC_EVERY_MIN between runs', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1', SYNC_EVERY_MIN: '3' } });
+  let calls = 0;
+  g.setFetch((url) => { if (/conversations.history/.test(url)) calls++; return slackFake([])(url); });
+  g.ctx.syncSlack(); g.ctx.syncSlack();
+  assert.strictEqual(calls, 1);
+  g.props.SLACK_LAST_SYNC = JSON.stringify({ at: new Date(Date.now() - 181000).toISOString() });
+  g.ctx.syncSlack();
+  assert.strictEqual(calls, 2);
+});
+
+t('importEndorsementHistory copies old AXO lines, re-runs safely, fixes open/closed', () => {
+  const OLD = '1WSI1MeqS421MSfTvh2HewJtBi9HVMKcib4EHJOCu8s0';
+  const row = (id, day, shift, qa, sections, at) => [id, day, shift, qa, JSON.stringify({ sections, fileRefs: [] }), at, at];
+  const g = loadGas({ external: { [OLD]: { Endorsements: [
+    ['Id', 'ShiftDate', 'Shift', 'QAResource', 'Payload', 'CreatedAt', 'UpdatedAt'],
+    row('e1', '2026-11-10', 'Day', 'Norma', { workedOn: [{ axo: '2001', status: 'Passed', note: 'ok' }, { axo: '9999', status: 'In Progress' }], nonAxo: [{ note: 'x' }] }, '2026-11-10T02:00:00.000Z'),
+    row('e2', '2026-11-11', 'Night', 'Ervin', { workedOn: [{ axo: '2002 (formerly 1)', status: 'Passed - Develop/Deployment', note: '' }], blocker: [{ axo: '2003', status: 'Blocked', note: 'env down' }] }, '2026-11-11T15:00:00.000Z')
+  ] } } });
+  ['2001', '2002', '2003'].forEach(nm => g.ctx.apiPasteAxo('Axo Number: ' + nm + ' - T\nDue Date: 2020-01-01'));
+  g.ctx.apiSetAxoState('2003', 'Closed'); // e.g. auto-closed as overdue
+  const r = plain(g.ctx.importEndorsementHistory());
+  assert.strictEqual(r.updatesAdded, 3);
+  assert.deepStrictEqual(r.notInTracker, ['9999']);
+  assert.strictEqual(r.closed, 1);   // 2002 passed develop/deployment
+  assert.strictEqual(r.reopened, 1); // 2003 is blocked, back to active
+  const b = plain(g.ctx.apiBootstrap());
+  const st = Object.fromEntries(b.axos.map(a => [a.axoNumber, a.state]));
+  assert.deepStrictEqual(st, { '2001': 'Active', '2002': 'Closed', '2003': 'Active' });
+  const u = b.updates.filter(x => x.axoNumber === '2001')[0];
+  assert.strictEqual(u.status, 'Passed - Initial');
+  assert.strictEqual(u.qa, 'Norma');
+  assert.strictEqual(u.createdAt, '2026-11-10T02:00:00.000Z');
+  assert.strictEqual(plain(g.ctx.importEndorsementHistory()).updatesAdded, 0);
+});
+
 console.log(n + ' tests passed');

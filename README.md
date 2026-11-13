@@ -70,7 +70,7 @@ channel and the workflow is not changed.
 6. In the Sheet: **AXO Tracker > Test Slack connection**. Check **Executions** in Apps Script:
    it should list the last few posts parsed as AXOs.
 7. **AXO Tracker > Import last 30 days from Slack** (one-time backfill).
-8. **AXO Tracker > Start auto-sync (every 5 min)**.
+8. **AXO Tracker > Start auto-sync (every 3 min)**.
 
 Keep the token private. It can read every private channel you are in, and it lives only in
 Script Properties, which only editors of the script can see. Don't share edit access to the

@@ -109,6 +109,20 @@
     if (/^(low|p3|p4)/.test(s)) return 'Low';
     return '';
   }
+  /* "Nov 14, 2026, 5:23 AM" in Manila time; '' when the value isn't a full timestamp. */
+  function fmtStamp(iso) {
+    if (!iso || !/T\d{2}:/.test(iso)) return '';
+    var d = new Date(iso);
+    if (isNaN(d)) return '';
+    return d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Manila' });
+  }
+  function stampLine(u) {
+    var made = fmtStamp(u.createdAt), edited = fmtStamp(u.updatedAt);
+    if (!made) return '';
+    var t = 'Logged ' + made;
+    if (edited && u.updatedAt.slice(0, 16) !== u.createdAt.slice(0, 16)) t += ' · edited ' + edited;
+    return '<time class="ev-time" datetime="' + esc(u.createdAt) + '">' + esc(t) + '</time>';
+  }
   function shortPrio(p) { var w = String(p || '').trim().split(/[\s(]/)[0]; return w || String(p || ''); }
   var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };
 
@@ -256,6 +270,10 @@
   }
 
   function renderBoard() {
+    var rep = S.queue === 'reports';
+    $('board').hidden = rep; $('reports').hidden = !rep;
+    $('reports-btn').setAttribute('aria-current', String(rep));
+    if (rep) { renderReports(); return; }
     var qd = queueDef(S.queue), list = filtered();
     $('board-title').innerHTML = esc(qd.label) + (S.qa ? ' <small>worked by ' + esc(S.qa) + ' · <button class="linkish" type="button" id="clear-qa">clear</button></small>' : '');
     if (!list.length) {
@@ -284,6 +302,133 @@
     var total = all().filter(qd.test).length;
     $('count').textContent = list.length === total ? list.length + ' AXO' + (list.length === 1 ? '' : 's') : list.length + ' of ' + total + ' AXOs';
     $('build').textContent = 'Build ' + S.data.build;
+  }
+
+  /* ---------- reports ---------- */
+  function manilaDay(iso) {
+    if (!iso) return '';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+    var d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+  }
+  function reportRange() {
+    var today = manilaNow().date, v = $('r-range').value, from = today, to = today;
+    if (v === 'week') { var wd = new Date(today + 'T00:00:00Z').getUTCDay(); from = addDays(today, -((wd + 6) % 7)); }
+    else if (v === '7') from = addDays(today, -6);
+    else if (v === '30') from = addDays(today, -29);
+    else if (v === 'month') from = today.slice(0, 8) + '01';
+    else if (v === 'custom') { from = $('r-from').value || today; to = $('r-to').value || today; if (from > to) { var t = from; from = to; to = t; } }
+    return { from: from, to: to };
+  }
+  function inRange(day, r) { return !!day && day >= r.from && day <= r.to; }
+
+  function reportData() {
+    var r = reportRange(), axos = all(), ups = [];
+    axos.forEach(function (a) { a.updates.forEach(function (u) { if (inRange(u.shiftDate, r)) ups.push(u); }); });
+    var isPass = function (s) { return /^Passed/.test(s); }, isFail = function (s) { return /^Failed/.test(s); };
+    var flag = function (s) { return s === 'Blocked' || s === 'Urgent/High Prio'; };
+
+    var per = {};
+    function row(n) { return per[n] = per[n] || { name: n, active: 0, axos: {}, updates: 0, Day: 0, Mid: 0, Night: 0, pass: 0, fail: 0, flag: 0, last: '' }; }
+    S.data.qas.forEach(row);
+    axos.forEach(function (a) { if (!a.closed) a.qas.forEach(function (q) { row(q).active++; }); });
+    ups.forEach(function (u) {
+      var p = row(u.qa || '(no name)');
+      p.updates++; p.axos[u.axoNumber] = 1; if (p[u.shift] != null) p[u.shift]++;
+      if (isPass(u.status)) p.pass++; if (isFail(u.status)) p.fail++; if (flag(u.status)) p.flag++;
+    });
+    axos.forEach(function (a) { a.updates.forEach(function (u) { var p = per[u.qa]; if (p && u.shiftDate > p.last) p.last = u.shiftDate; }); });
+    var team = Object.keys(per).map(function (k) { var p = per[k]; p.worked = Object.keys(p.axos).length; return p; })
+      .sort(function (x, y) { return y.updates - x.updates || y.active - x.active || x.name.localeCompare(y.name); });
+
+    var status = {};
+    axos.forEach(function (a) { if (!a.closed) { var k = a.status || 'No QA yet'; status[k] = (status[k] || 0) + 1; } });
+
+    var clients = {};
+    axos.forEach(function (a) {
+      if (!inRange(manilaDay(a.postedAt || a.createdAt), r)) return;
+      var c = a.client || 'No client'; clients[c] = (clients[c] || 0) + 1;
+    });
+
+    return {
+      range: r, team: team, status: status, clients: clients,
+      tiles: {
+        received: axos.filter(function (a) { return inRange(manilaDay(a.postedAt || a.createdAt), r); }).length,
+        closed: axos.filter(function (a) { return a.closed && inRange(manilaDay(a.closedAt), r); }).length,
+        updates: ups.length,
+        worked: Object.keys(ups.reduce(function (m, u) { m[u.axoNumber] = 1; return m; }, {})).length,
+        pass: ups.filter(function (u) { return isPass(u.status); }).length,
+        fail: ups.filter(function (u) { return isFail(u.status); }).length,
+        active: axos.filter(function (a) { return !a.closed; }).length,
+        needs: axos.filter(queueDef('needs').test).length
+      }
+    };
+  }
+
+  function renderReports() {
+    $('r-custom').hidden = $('r-range').value !== 'custom';
+    var d = reportData(), r = d.range, t = d.tiles;
+    var label = r.from === r.to ? fmtDay(r.from, true) : fmtDay(r.from, true) + ' to ' + fmtDay(r.to, true);
+    var tiles = [[t.received, 'AXOs received'], [t.worked, 'AXOs worked on'], [t.updates, 'QA updates'], [t.pass, 'passed'], [t.fail, 'failed'], [t.closed, 'AXOs closed'], [t.active, 'active now'], [t.needs, 'need a QA now']];
+    var maxUp = Math.max.apply(null, d.team.map(function (p) { return p.updates; }).concat(1));
+    function num(n, cls) { return '<td class="' + (n ? cls || '' : 'zero') + '">' + n + '</td>'; }
+    var rows = d.team.map(function (p) {
+      return '<tr data-qa="' + esc(p.name) + '" title="Show ' + esc(p.name) + '\'s active AXOs"><td><span class="who">' + avatar(p.name, 'sm') + esc(p.name) + '</span></td>' +
+        num(p.active) + num(p.worked) + '<td class="' + (p.updates ? '' : 'zero') + '">' + p.updates + '<span class="r-load"><i style="width:' + Math.round(100 * p.updates / maxUp) + '%"></i></span></td>' +
+        num(p.Day) + num(p.Mid) + num(p.Night) + num(p.pass, 'ok') + num(p.fail, 'bad') + num(p.flag, 'bad') +
+        '<td class="' + (p.last ? '' : 'zero') + '">' + (p.last ? esc(fmtDay(p.last)) : 'never') + '</td></tr>';
+    }).join('');
+    var order = ['No QA yet'].concat(S.data.statuses);
+    var sKeys = Object.keys(d.status).sort(function (x, y) { return order.indexOf(x) - order.indexOf(y); });
+    var sMax = Math.max.apply(null, sKeys.map(function (k) { return d.status[k]; }).concat(1));
+    var bars = sKeys.map(function (k) {
+      return '<div class="r-bar"><span>' + esc(k) + '</span><span class="track"><i style="--c:' + (k === 'No QA yet' ? 'var(--orange)' : sColor(k)) + ';width:' + Math.round(100 * d.status[k] / sMax) + '%"></i></span><b>' + d.status[k] + '</b></div>';
+    }).join('') || '<div class="tl-empty">No active AXOs.</div>';
+    var cKeys = Object.keys(d.clients).sort(function (x, y) { return d.clients[y] - d.clients[x] || x.localeCompare(y); });
+    var cMax = Math.max.apply(null, cKeys.map(function (k) { return d.clients[k]; }).concat(1));
+    var cbars = cKeys.map(function (k) {
+      return '<div class="r-bar"><span>' + esc(k) + '</span><span class="track"><i style="--c:var(--sky);width:' + Math.round(100 * d.clients[k] / cMax) + '%"></i></span><b>' + d.clients[k] + '</b></div>';
+    }).join('') || '<div class="tl-empty">No AXOs received in this range.</div>';
+
+    $('r-body').innerHTML =
+      '<p class="r-sub">' + esc(label) + ' · QA work counts by shift date; "active now" and the status breakdown are live.</p>' +
+      '<div class="r-tiles">' + tiles.map(function (x) { return '<div class="r-tile"><b>' + x[0] + '</b><span>' + x[1] + '</span></div>'; }).join('') + '</div>' +
+      '<section class="r-card"><h3>QA workload</h3><p class="r-sub">Click a name to see that QA\'s active AXOs.</p><div class="r-scroll"><table class="r-table"><thead><tr>' +
+      '<th>QA</th><th>Active AXOs</th><th>AXOs worked</th><th>Updates</th><th>Day</th><th>Mid</th><th>Night</th><th>Passed</th><th>Failed</th><th>Blocked or urgent</th><th>Last update</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div></section>' +
+      '<div class="r-two"><section class="r-card"><h3>Active AXOs by status</h3><p class="r-sub">Latest QA status of every open AXO.</p><div class="r-bars">' + bars + '</div></section>' +
+      '<section class="r-card"><h3>AXOs received by client</h3><p class="r-sub">' + esc(label) + '</p><div class="r-bars">' + cbars + '</div></section></div>';
+    $('count').textContent = '';
+    S.lastReport = d;
+  }
+
+  function reportCsv(d) {
+    function q(v) { v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+    var t = d.tiles, lines = [];
+    lines.push(['NPD QA AXO Tracker report', d.range.from + ' to ' + d.range.to].map(q).join(','));
+    lines.push('');
+    lines.push('Metric,Count');
+    [['AXOs received', t.received], ['AXOs worked on', t.worked], ['QA updates', t.updates], ['Passed', t.pass], ['Failed', t.fail],
+      ['AXOs closed', t.closed], ['Active now', t.active], ['Need a QA now', t.needs]].forEach(function (x) { lines.push(x.map(q).join(',')); });
+    lines.push('');
+    lines.push('QA,Active AXOs,AXOs worked,Updates,Day,Mid,Night,Passed,Failed,Blocked or urgent,Last update');
+    d.team.forEach(function (p) { lines.push([p.name, p.active, p.worked, p.updates, p.Day, p.Mid, p.Night, p.pass, p.fail, p.flag, p.last].map(q).join(',')); });
+    lines.push('');
+    lines.push('Status (active AXOs),Count');
+    Object.keys(d.status).forEach(function (k) { lines.push([k, d.status[k]].map(q).join(',')); });
+    return lines.join('\n');
+  }
+  function copyText(text) {
+    function fallback() {
+      var ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+      ta.remove(); return ok;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fallback(); });
+    }
+    return Promise.resolve(fallback());
   }
 
   /* ---------- detail panel ---------- */
@@ -347,9 +492,10 @@
   function renderDetail() {
     var el = $('detail'), shell = $('shell');
     var a = S.byNum[S.open];
+    if (S.queue === 'reports') a = null;
     if (!a) {
       S.open = '';
-      el.hidden = window.matchMedia('(max-width:1240px)').matches;
+      el.hidden = S.queue === 'reports' || window.matchMedia('(max-width:1240px)').matches;
       $('scrim').hidden = true;
       shell.classList.toggle('no-detail', el.hidden);
       el.innerHTML = '<div class="d-empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>' +
@@ -379,6 +525,7 @@
         '<span>' + esc(fmtDay(u.shiftDate)) + ' · ' + esc(u.shift) + '</span>' +
         (own ? '<span class="acts"><button class="linkish" type="button" data-edit="' + esc(u.id) + '">Edit</button>' +
           '<button class="linkish danger" type="button" data-del="' + esc(u.id) + '">Delete</button></span>' : '') + '</div>' +
+        stampLine(u) +
         (u.notes ? '<p>' + esc(u.notes) + '</p>' : '') + (links ? '<div class="links">' + links + '</div>' : '') + '</li>';
     }).join('') : '';
 
@@ -516,7 +663,7 @@
     return call('apiBootstrap').then(function (d) { S.data = d; render(); }, function (e) { toast(e.message, true); });
   }
   function savePrefs() {
-    store('npdqa.view', JSON.stringify({ queue: S.queue, qa: S.qa, prio: $('f-prio').value, client: $('f-client').value, sort: $('f-sort').value }));
+    store('npdqa.view', JSON.stringify({ queue: S.queue, qa: S.qa, prio: $('f-prio').value, client: $('f-client').value, sort: $('f-sort').value, range: $('r-range').value, from: $('r-from').value, to: $('r-to').value }));
   }
   function loadPrefs() {
     var p = null;
@@ -526,6 +673,9 @@
     if (p.prio) $('f-prio').setAttribute('data-want', p.prio);
     if (p.client) $('f-client').setAttribute('data-want', p.client);
     if (p.sort) $('f-sort').value = p.sort;
+    if (p.range) $('r-range').value = p.range;
+    if (p.from) $('r-from').value = p.from;
+    if (p.to) $('r-to').value = p.to;
   }
 
   /* ---------- events ---------- */
@@ -543,9 +693,24 @@
 
     function pickQueue(e) {
       var b = e.target.closest('[data-queue]'); if (!b) return;
-      S.queue = b.getAttribute('data-queue'); savePrefs(); renderRail(); renderBoard();
+      var was = S.queue; S.queue = b.getAttribute('data-queue'); savePrefs(); renderRail(); renderBoard();
+      if (was === 'reports' || S.queue === 'reports') renderDetail();
     }
     $('queues').onclick = pickQueue; $('stats').onclick = pickQueue;
+    $('reports-btn').onclick = function () {
+      if (S.dirty && !confirmDiscard()) return;
+      S.queue = 'reports'; S.open = ''; S.composerFor = ''; S.dirty = false; savePrefs(); renderRail(); renderBoard(); renderDetail();
+      window.scrollTo(0, 0);
+    };
+    ['r-range', 'r-from', 'r-to'].forEach(function (id) { $(id).addEventListener('change', function () { savePrefs(); renderReports(); }); });
+    $('r-copy').onclick = function () {
+      if (!S.lastReport) return;
+      copyText(reportCsv(S.lastReport)).then(function (ok) { toast(ok ? 'Report copied. Paste it into a sheet or email.' : 'Copy was blocked by the browser.', !ok); });
+    };
+    $('r-body').onclick = function (e) {
+      var tr = e.target.closest('tr[data-qa]'); if (!tr) return;
+      S.qa = tr.getAttribute('data-qa'); S.queue = 'active'; savePrefs(); renderRail(); renderBoard(); renderDetail(); window.scrollTo(0, 0);
+    };
     $('team').onclick = function (e) {
       var b = e.target.closest('[data-qa]'); if (!b) return;
       var q = b.getAttribute('data-qa'); S.qa = S.qa === q ? '' : q; savePrefs(); renderRail(); renderBoard();
@@ -606,7 +771,25 @@
     }, 120000);
   }
 
+  /* Frozen header: publish the top bar's height so the filter row, rail and
+     detail panel pin just under it, and add shadows once the page scrolls. */
+  function pinHeader() {
+    var bar = $('topbar'), head = document.querySelector('.board-head');
+    function pinned() { return getComputedStyle(bar).position === 'sticky'; }
+    function measure() { document.documentElement.style.setProperty('--top-h', (pinned() ? bar.offsetHeight : 0) + 'px'); }
+    function onScroll() {
+      var y = window.scrollY > 4;
+      bar.classList.toggle('scrolled', y);
+      if (head) head.classList.toggle('stuck', head.getBoundingClientRect().top <= (pinned() ? bar.offsetHeight : 0) + 1 && y);
+    }
+    measure(); onScroll();
+    if (window.ResizeObserver) new ResizeObserver(measure).observe(bar);
+    window.addEventListener('resize', measure);
+    window.addEventListener('scroll', onScroll, { passive: true });
+  }
+
   wire();
+  pinHeader();
   loadPrefs();
   refresh();
 })();

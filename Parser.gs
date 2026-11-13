@@ -234,11 +234,63 @@ function mergeAxo(existing, incoming) {
   return out;
 }
 
+/* Turn rows of the old NPD QA Endorsement Tracker's "Endorsements" sheet
+   (Id, ShiftDate, Shift, QAResource, Payload, CreatedAt, UpdatedAt) into
+   updates for this tracker. Each AXO line in an endorsement becomes one
+   update; ids are stable ("legacy-…") so a re-run never duplicates.
+   Non-AXO notes and shift-level file links have no AXO to attach to, so
+   they are left out. */
+var LEGACY_STATUS = { 'Passed': 'Passed - Initial', 'Failed': 'Failed - Initial' };
+var LEGACY_SECTIONS = ['workedOn', 'needsMonitoring', 'blocker', 'urgent', 'notTested'];
+function legacyUpdatesFrom(rows) {
+  var out = [];
+  (rows || []).forEach(function (r) {
+    var endId = String(r[0] || '').trim();
+    if (!endId) return;
+    var day = String(r[1] || '').match(/^(\d{4}-\d{2}-\d{2})/);
+    if (!day) return;
+    var payload = {};
+    try { payload = JSON.parse(r[4] || '{}'); } catch (e) { return; }
+    var sections = payload && typeof payload.sections === 'object' && payload.sections ? payload.sections : payload;
+    LEGACY_SECTIONS.forEach(function (key) {
+      var list = Array.isArray(sections[key]) ? sections[key] : [];
+      list.forEach(function (e, i) {
+        var m = String((e && e.axo) || '').match(/^\s*#?(\d{3,})/);
+        if (!m) return;
+        out.push({
+          id: 'legacy-' + endId + '-' + key + '-' + i,
+          axoNumber: m[1],
+          qa: String(r[3] || '').trim(),
+          shiftDate: day[1],
+          shift: String(r[2] || 'Day').trim(),
+          status: LEGACY_STATUS[e.status] || e.status || 'Not Tested',
+          notes: String(e.note || ''),
+          files: [],
+          createdAt: String(r[5] || ''),
+          updatedAt: String(r[6] || r[5] || '')
+        });
+      });
+    });
+  });
+  return out;
+}
+
+/* Newest update first: shift date, then shift (Night after Day), then save time. */
+function latestUpdate(updates) {
+  var rank = { Day: 0, Mid: 1, Night: 2 };
+  return (updates || []).slice().sort(function (x, y) {
+    return String(y.shiftDate).localeCompare(String(x.shiftDate)) ||
+      (rank[y.shift] == null ? 3 : rank[y.shift]) - (rank[x.shift] == null ? 3 : rank[x.shift]) ||
+      String(y.createdAt).localeCompare(String(x.createdAt));
+  })[0] || null;
+}
+
 /* Node export for tests; ignored by Apps Script. */
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     cleanSlackText: cleanSlackText, blocksToText: blocksToText, splitAxoLine: splitAxoLine,
     normalizeDueDate: normalizeDueDate, parseAssignments: parseAssignments,
-    parseAxoPost: parseAxoPost, mergeAxo: mergeAxo
+    parseAxoPost: parseAxoPost, mergeAxo: mergeAxo,
+    legacyUpdatesFrom: legacyUpdatesFrom, latestUpdate: latestUpdate
   };
 }
