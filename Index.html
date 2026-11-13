@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NPD QA AXO Tracker</title>
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brandbar">
+      <svg width="36" height="29" viewBox="0 0 36 32" role="img" aria-label="ShipERP">
+        <g class="box" fill="none" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round">
+          <path d="M21 4 L34 9.5 L21 15 L8 9.5 Z"/><path d="M34 9.5 V22 L21 27.5 L8 22 V9.5"/><path d="M21 15 V27.5"/>
+        </g>
+        <g class="speed" fill="none" stroke-width="2.1" stroke-linecap="round">
+          <path d="M1 12 H6.5"/><path d="M1 17.5 H5"/><path d="M2.5 23 H6"/>
+        </g>
+      </svg>
+      <div class="wordmark">Ship<span>ERP</span></div>
+      <span class="divider" aria-hidden="true"></span>
+      <span class="app-name">AXO Tracker</span>
+      <span class="role">NPD QA</span>
+    </div>
+    <label class="me" for="me-select">You
+      <select id="me-select"><option value="">Pick your name</option></select>
+    </label>
+    <span class="sync" id="sync"><i></i><span id="sync-text">Loading</span></span>
+    <button class="btn btn-quiet" id="sync-btn" type="button" hidden>Sync now</button>
+    <button class="help-link btn-quiet" id="help-btn" type="button" style="border:0;background:none;cursor:pointer">How to use</button>
+    <button class="btn" id="paste-btn" type="button">Paste AXO</button>
+    <button class="btn btn-primary" id="add-btn" type="button">Add update</button>
+  </header>
+
+  <main class="wrap">
+    <div class="page-head">
+      <div>
+        <div class="eyebrow">NPD QA</div>
+        <h1>AXO Tracker</h1>
+        <p class="lede" id="lede">Loading the tracker…</p>
+      </div>
+      <div class="quarters">
+        <div class="q-tabs" id="scope-tabs" role="tablist" aria-label="Which AXOs"></div>
+      </div>
+    </div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="insights">
+      <section class="panel breakdown" aria-labelledby="bd-title">
+        <div class="breakdown-head"><h2 id="bd-title">Latest QA status</h2><span>Active AXOs. Click a status to filter</span></div>
+        <div class="stack" id="stack"></div>
+        <div class="legend" id="legend"></div>
+      </section>
+
+      <section class="panel breakdown workload" aria-labelledby="wl-title">
+        <div class="breakdown-head"><h2 id="wl-title">QA workload</h2><span>AXOs each QA has updated. Click a name to filter</span></div>
+        <div class="wl-key" aria-hidden="true">
+          <span><i class="g-ip"></i>Active</span><span><i class="g-co"></i>Closed</span>
+        </div>
+        <div class="wl-list" id="workload"></div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="filters">
+        <div class="field"><label for="f-q">Search</label><input type="search" id="f-q" placeholder="AXO number, title, client, dev…"></div>
+        <div class="field"><label for="f-status">QA status</label><select id="f-status"></select></div>
+        <div class="field"><label for="f-qa">QA</label><select id="f-qa"></select></div>
+        <div class="field"><label for="f-prio">Priority</label><select id="f-prio"></select></div>
+        <div class="field"><label for="f-client">Client</label><select id="f-client"></select></div>
+        <label class="toggle"><input type="checkbox" id="f-mine">Mine only</label>
+        <label class="toggle"><input type="checkbox" id="f-due">Due in 2 days</label>
+        <label class="toggle"><input type="checkbox" id="f-none">No QA update yet</label>
+        <button class="btn btn-quiet" id="f-clear" type="button">Clear</button>
+      </div>
+      <div class="table-scroll">
+        <table class="axo-table">
+          <thead>
+            <tr>
+              <th data-sort="axo">AXO<span class="arr">▾</span></th>
+              <th data-sort="title">Name<span class="arr">▾</span></th>
+              <th data-sort="prio">Priority<span class="arr">▾</span></th>
+              <th data-sort="due">Due<span class="arr">▾</span></th>
+              <th data-sort="status">QA status<span class="arr">▾</span></th>
+              <th>QAs</th>
+              <th data-sort="updated">Last update<span class="arr">▾</span></th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="rows"><tr><td colspan="8" class="loading">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="table-foot"><span id="count"></span><span id="build" class="muted"></span></div>
+    </section>
+  </main>
+
+  <!-- AXO drawer -->
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" hidden aria-labelledby="d-title" role="dialog">
+    <div class="d-head">
+      <div class="d-top">
+        <span class="mono" id="d-num"></span>
+        <span id="d-state"></span>
+        <div class="d-actions">
+          <a class="btn btn-sm" id="d-link" target="_blank" rel="noopener">Open in Axosoft</a>
+          <button class="btn btn-sm" id="d-toggle" type="button"></button>
+          <button class="btn btn-sm btn-quiet" id="d-close" type="button" aria-label="Close">✕</button>
+        </div>
+      </div>
+      <h2 id="d-title"></h2>
+      <div class="people" id="d-people"></div>
+    </div>
+    <div class="d-body">
+      <section>
+        <button class="btn btn-primary" id="d-add" type="button">Add my update</button>
+      </section>
+      <section><h3>Updates</h3><ul class="notes" id="d-updates"></ul></section>
+      <section><h3>Details</h3><dl class="facts" id="d-facts"></dl></section>
+      <section id="d-info-wrap"><h3>Additional info</h3><div class="info-box" id="d-info"></div></section>
+    </div>
+  </aside>
+
+  <!-- Add / edit update -->
+  <dialog id="upd-dlg" class="dlg-wide">
+    <form method="dialog" id="upd-form">
+      <div class="dlg-head"><h2 id="upd-title">Add update</h2><p id="upd-sub"></p></div>
+      <div class="dlg-body">
+        <div class="qa-grid">
+          <label class="full" id="upd-axo-wrap">AXO
+            <input id="upd-axo" list="axo-options" placeholder="Type an AXO number or title" autocomplete="off">
+            <datalist id="axo-options"></datalist>
+          </label>
+          <label>Status<select id="upd-status"></select></label>
+          <label>QA<input id="upd-qa" readonly></label>
+          <label>Shift date<input type="date" id="upd-date"></label>
+          <label>Shift<select id="upd-shift"></select></label>
+          <label class="full">Notes<textarea id="upd-notes" placeholder="What you tested, what you found, what the next shift should know"></textarea></label>
+          <div class="full">
+            <div class="dlg-field" style="margin-top:0">Test files and links</div>
+            <div class="link-rows" id="upd-links" style="margin-top:6px"></div>
+            <button class="linkish" id="upd-add-link" type="button">+ Add a link</button>
+          </div>
+        </div>
+        <div class="dlg-err" id="upd-err" hidden></div>
+      </div>
+      <div class="dlg-foot">
+        <button class="btn" value="cancel" type="button" id="upd-cancel">Cancel</button>
+        <button class="btn btn-primary" id="upd-save" type="submit">Save update</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Paste AXO -->
+  <dialog id="paste-dlg" class="dlg-wide">
+    <form method="dialog" id="paste-form">
+      <div class="dlg-head"><h2>Paste AXO</h2><p>Copy the whole post from #axo-assignments (and the "assigned to" reply if there is one) and paste it here.</p></div>
+      <div class="dlg-body">
+        <label class="dlg-field">Slack post<textarea id="paste-text" placeholder="Axo Number: 15611 - [Frontend] - Bug AXO: …&#10;Priority: High&#10;Link: https://…"></textarea></label>
+        <div class="parsed" id="paste-preview" hidden></div>
+        <div class="dlg-err" id="paste-err" hidden></div>
+      </div>
+      <div class="dlg-foot">
+        <button class="btn" type="button" id="paste-cancel">Cancel</button>
+        <button class="btn" type="button" id="paste-check">Check</button>
+        <button class="btn btn-primary" type="submit" id="paste-save" disabled>Add AXO</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- How to use -->
+  <dialog id="help-dlg">
+    <div class="dlg-head"><h2>How to use</h2><p>AXOs come in from #axo-assignments on their own. You only add your updates.</p></div>
+    <div class="dlg-body howto">
+      <ol>
+        <li>Pick your name under <b>You</b> at the top. It is remembered on this browser.</li>
+        <li>Find the AXO you worked on (search by number or title) and click <b>Update</b>, or use <b>Add update</b> at the top.</li>
+        <li>Pick a status, the shift date and shift, write your notes, and add any test file links. Every update is kept, so the next shift sees the full history.</li>
+        <li>An update of <b>Passed - Develop/Deployment</b> closes the AXO. Use <b>Reopen</b> in the AXO panel if it needs more work.</li>
+        <li>If an AXO is missing, copy its Slack post and use <b>Paste AXO</b>.</li>
+      </ol>
+    </div>
+    <div class="dlg-foot"><button class="btn btn-primary" type="button" id="help-close">Got it</button></div>
+  </dialog>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <?!= include('Script'); ?>
+</body>
+</html>

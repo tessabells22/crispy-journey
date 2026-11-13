@@ -1,0 +1,663 @@
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- state ---------- */
+  var S = {
+    data: null,          // apiBootstrap() result
+    byNum: {},           // axoNumber -> derived AXO
+    scope: 'active',     // active | closed | all
+    kpi: '',             // KPI filter key
+    sort: { key: 'axo', dir: -1 },
+    openAxo: '',         // drawer AXO number
+    editId: ''           // update being edited
+  };
+
+  var STATUS_CLASS = {
+    'Not Tested': 'wf-new',
+    'In Progress': 'wf-approved',
+    'Passed - Initial': 'wf-cases',
+    'Passed - Develop/Deployment': 'wf-ready',
+    'Failed - Initial': 'wf-rework',
+    'Failed - Develop/Deployment': 'wf-rejected',
+    'Needs Monitoring': 'wf-review',
+    'Urgent/High Prio': 'wf-file',
+    'Blocked': 'wf-dev'
+  };
+  var STATUS_COLOR = {
+    'Not Tested': 'var(--wf-new)', 'In Progress': 'var(--wf-approved)', 'Passed - Initial': 'var(--wf-cases)',
+    'Passed - Develop/Deployment': 'var(--wf-ready)', 'Failed - Initial': 'var(--wf-rework)',
+    'Failed - Develop/Deployment': 'var(--wf-rejected)', 'Needs Monitoring': 'var(--wf-review)',
+    'Urgent/High Prio': 'var(--wf-file)', 'Blocked': 'var(--wf-dev)'
+  };
+  var NO_UPDATE = 'No QA update';
+
+  /* ---------- helpers ---------- */
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function safeUrl(u) { return /^https?:\/\//i.test(String(u || '')) ? String(u) : ''; }
+  function store(key, v) {
+    try { if (v === undefined) return localStorage.getItem(key) || ''; localStorage.setItem(key, v); } catch (e) {}
+    return '';
+  }
+  function toast(msg, err) {
+    var t = $('toast');
+    t.textContent = msg; t.className = 'toast' + (err ? ' err' : ''); t.hidden = false;
+    clearTimeout(toast._t); toast._t = setTimeout(function () { t.hidden = true; }, err ? 6000 : 3000);
+  }
+  function call(fn) {
+    var args = [].slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var r = google.script.run.withSuccessHandler(resolve).withFailureHandler(function (e) {
+        reject(e && e.message ? e : new Error(String(e)));
+      });
+      r[fn].apply(r, args);
+    });
+  }
+
+  /* Manila "now": date + hour, and the shift that is on. */
+  function manilaNow() {
+    var parts = {};
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' })
+      .formatToParts(new Date()).forEach(function (p) { parts[p.type] = p.value; });
+    return { date: parts.year + '-' + parts.month + '-' + parts.day, hour: Number(parts.hour) };
+  }
+  function addDays(iso, n) {
+    var d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+  function currentShift() {
+    var m = manilaNow();
+    if (m.hour >= 5 && m.hour <= 12) return { date: m.date, shift: 'Day' };
+    if (m.hour >= 13 && m.hour <= 21) return { date: m.date, shift: 'Mid' };
+    return { date: m.hour < 5 ? addDays(m.date, -1) : m.date, shift: 'Night' };
+  }
+  function shiftRank(s) { return s === 'Day' ? 0 : s === 'Mid' ? 1 : s === 'Night' ? 2 : 3; }
+  function fmtDay(iso) {
+    if (!/^\d{4}-\d{2}-\d{2}/.test(iso || '')) return iso || '';
+    var d = new Date(iso.slice(0, 10) + 'T00:00:00Z');
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  }
+  function ago(iso) {
+    if (!iso) return '';
+    var s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' d ago';
+  }
+  function prioClass(p) {
+    var s = String(p || '').toLowerCase();
+    if (/urgent|critical|blocker|p0/.test(s)) return 'Urgent';
+    if (/high|p1/.test(s)) return 'High';
+    if (/med|normal|p2/.test(s)) return 'Medium';
+    if (/low|p3|p4/.test(s)) return 'Low';
+    return '';
+  }
+  var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };
+
+  function me() { return store('npdqa.me'); }
+
+  /* ---------- derive ---------- */
+  function derive() {
+    var d = S.data, byNum = {};
+    d.axos.forEach(function (a) {
+      byNum[a.axoNumber] = Object.assign({}, a, { updates: [], qas: [] });
+    });
+    d.updates.forEach(function (u) { if (byNum[u.axoNumber]) byNum[u.axoNumber].updates.push(u); });
+    var today = manilaNow().date;
+    Object.keys(byNum).forEach(function (k) {
+      var a = byNum[k];
+      a.updates.sort(function (x, y) {
+        return (y.shiftDate || '').localeCompare(x.shiftDate || '') ||
+          shiftRank(y.shift) - shiftRank(x.shift) ||
+          (y.createdAt || '').localeCompare(x.createdAt || '');
+      });
+      a.latest = a.updates[0] || null;
+      a.status = a.latest ? a.latest.status : NO_UPDATE;
+      var seen = {};
+      a.updates.forEach(function (u) { if (u.qa && !seen[u.qa]) { seen[u.qa] = 1; a.qas.push(u.qa); } });
+      a.prio = prioClass(a.priority);
+      a.closed = a.state === 'Closed';
+      a.dueIn = a.dueDate ? Math.round((new Date(a.dueDate + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 864e5) : null;
+      a.lastAt = a.latest ? (a.latest.shiftDate + ' ' + shiftRank(a.latest.shift) + ' ' + a.latest.createdAt) : '';
+    });
+    S.byNum = byNum;
+  }
+
+  function allAxos() { return Object.keys(S.byNum).map(function (k) { return S.byNum[k]; }); }
+  function inScope(a) { return S.scope === 'all' || (S.scope === 'closed' ? a.closed : !a.closed); }
+
+  var KPIS = [
+    { key: '', label: 'Active', tone: 't-brand', test: function () { return true; }, sub: 'open AXOs' },
+    { key: 'none', label: 'No QA update', tone: 't-neu', test: function (a) { return !a.latest; }, sub: 'nobody has picked it up' },
+    { key: 'progress', label: 'In progress', tone: 't-sky', test: function (a) { return a.latest && ['Not Tested', 'In Progress', 'Passed - Initial'].indexOf(a.status) >= 0; }, sub: 'not tested, in progress, passed initial' },
+    { key: 'failed', label: 'Failed', tone: 't-orange', test: function (a) { return /^Failed/.test(a.status); }, sub: 'initial or develop/deployment' },
+    { key: 'monitor', label: 'Needs monitoring', tone: 't-neu', test: function (a) { return a.status === 'Needs Monitoring'; }, sub: 'keep an eye on it' },
+    { key: 'urgent', label: 'Urgent / high prio', tone: 't-bad', test: function (a) { return a.status === 'Urgent/High Prio' || a.prio === 'Urgent' || a.prio === 'High'; }, sub: 'status or Slack priority' },
+    { key: 'blocked', label: 'Blocked', tone: 't-bad', test: function (a) { return a.status === 'Blocked'; }, sub: 'latest update says blocked' },
+    { key: 'due', label: 'Due in 2 days', tone: 't-orange', test: function (a) { return a.dueIn !== null && a.dueIn <= 2; }, sub: '' }
+  ];
+
+  /* ---------- filters ---------- */
+  function readFilters() {
+    return {
+      q: $('f-q').value.trim().toLowerCase(), status: $('f-status').value, qa: $('f-qa').value,
+      prio: $('f-prio').value, client: $('f-client').value,
+      mine: $('f-mine').checked, due: $('f-due').checked, none: $('f-none').checked
+    };
+  }
+  function matches(a, f) {
+    if (!inScope(a)) return false;
+    if (S.kpi) {
+      var k = KPIS.filter(function (x) { return x.key === S.kpi; })[0];
+      if (k && !k.test(a)) return false;
+    }
+    if (f.status && a.status !== f.status) return false;
+    if (f.qa && a.qas.indexOf(f.qa) < 0) return false;
+    if (f.prio && (f.prio === '(none)' ? a.prio !== '' : a.prio !== f.prio)) return false;
+    if (f.client && a.client !== f.client) return false;
+    if (f.mine && a.qas.indexOf(me()) < 0) return false;
+    if (f.due && !(a.dueIn !== null && a.dueIn <= 2)) return false;
+    if (f.none && a.latest) return false;
+    if (f.q) {
+      var hay = [a.axoNumber, a.title, a.client, a.ticketNumber, a.raisedBy, a.devAssignees.join(' '), a.qas.join(' ')].join(' ').toLowerCase();
+      if (hay.indexOf(f.q) < 0) return false;
+    }
+    return true;
+  }
+  function fillSelect(sel, opts, keep) {
+    var v = keep ? sel.value : '';
+    sel.innerHTML = opts.map(function (o) {
+      var val = typeof o === 'string' ? o : o[0], lab = typeof o === 'string' ? o : o[1];
+      return '<option value="' + esc(val) + '">' + esc(lab) + '</option>';
+    }).join('');
+    if (keep) sel.value = v;
+    if (sel.selectedIndex < 0) sel.selectedIndex = 0;
+  }
+  function buildFilterOptions() {
+    var axos = allAxos();
+    fillSelect($('f-status'), [['', 'All']].concat(S.data.statuses).concat([NO_UPDATE]), true);
+    var qas = {};
+    S.data.qas.forEach(function (q) { qas[q] = 1; });
+    S.data.updates.forEach(function (u) { if (u.qa) qas[u.qa] = 1; });
+    fillSelect($('f-qa'), [['', 'Anyone']].concat(Object.keys(qas).sort()), true);
+    fillSelect($('f-prio'), [['', 'All'], 'Urgent', 'High', 'Medium', 'Low', ['(none)', 'Other / not set']], true);
+    var clients = {};
+    axos.forEach(function (a) { if (a.client) clients[a.client] = 1; });
+    fillSelect($('f-client'), [['', 'All']].concat(Object.keys(clients).sort()), true);
+    if (S.pendingSelects) {
+      var f = S.pendingSelects; S.pendingSelects = null;
+      ['status', 'qa', 'prio', 'client'].forEach(function (k) {
+        var sel = $('f-' + k);
+        if (f[k]) { sel.value = f[k]; if (sel.selectedIndex < 0) sel.selectedIndex = 0; }
+      });
+    }
+  }
+  function saveFilters() {
+    store('npdqa.filters', JSON.stringify({ f: readFilters(), scope: S.scope, sort: S.sort }));
+  }
+  function loadFilters() {
+    var saved = null;
+    try { saved = JSON.parse(store('npdqa.filters') || 'null'); } catch (e) {}
+    if (!saved) return;
+    var f = saved.f || {};
+    $('f-q').value = f.q || '';
+    S.pendingSelects = f; // applied once the options exist (buildFilterOptions)
+    $('f-mine').checked = !!f.mine; $('f-due').checked = !!f.due; $('f-none').checked = !!f.none;
+    if (saved.scope) S.scope = saved.scope;
+    if (saved.sort) S.sort = saved.sort;
+  }
+
+  /* ---------- render ---------- */
+  function render() {
+    derive();
+    buildFilterOptions();
+    renderMe();
+    renderHead();
+    renderKpis();
+    renderBreakdown();
+    renderWorkload();
+    renderRows();
+    if (S.openAxo) renderDrawer();
+    $('build').textContent = 'Build ' + S.data.build;
+  }
+
+  function renderMe() {
+    var sel = $('me-select'), cur = me();
+    var names = S.data.qas.slice();
+    if (cur && names.indexOf(cur) < 0) names.push(cur);
+    sel.innerHTML = '<option value="">Pick your name</option>' + names.map(function (n) {
+      return '<option' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+    }).join('');
+    $('me-select').parentNode.classList.toggle('missing', !cur);
+  }
+
+  function renderHead() {
+    var axos = allAxos();
+    var active = axos.filter(function (a) { return !a.closed; }).length;
+    var sl = S.data.slack, parts = [];
+    parts.push('<b>' + active + '</b> active AXO' + (active === 1 ? '' : 's'));
+    parts.push('<b>' + (axos.length - active) + '</b> closed');
+    parts.push(S.data.updates.length + ' QA update' + (S.data.updates.length === 1 ? '' : 's'));
+    $('lede').innerHTML = parts.join(' · ');
+
+    var sync = $('sync'), txt;
+    sync.className = 'sync';
+    if (!sl.configured) { txt = 'Slack not connected · use Paste AXO'; sync.className = 'sync err'; }
+    else if (sl.lastError && sl.lastError.at && (!sl.lastSync.at || sl.lastError.at > sl.lastSync.at)) {
+      txt = 'Slack sync failed ' + ago(sl.lastError.at); sync.className = 'sync err'; sync.title = sl.lastError.error || '';
+    } else txt = sl.lastSync.at ? 'Synced ' + ago(sl.lastSync.at) : 'Waiting for first sync';
+    $('sync-text').textContent = txt;
+    $('sync-btn').hidden = !sl.configured;
+
+    var counts = { active: active, closed: axos.length - active, all: axos.length };
+    $('scope-tabs').innerHTML = [['active', 'Active'], ['closed', 'Closed'], ['all', 'All']].map(function (t) {
+      return '<button role="tab" type="button" data-scope="' + t[0] + '" aria-selected="' + (S.scope === t[0]) + '">' +
+        t[1] + ' <span class="n">' + counts[t[0]] + '</span></button>';
+    }).join('');
+  }
+
+  function renderKpis() {
+    var axos = allAxos().filter(function (a) { return !a.closed; });
+    $('kpis').innerHTML = KPIS.map(function (k) {
+      var list = axos.filter(k.test), sub = k.sub;
+      if (k.key === 'due') {
+        var late = list.filter(function (a) { return a.dueIn < 0; }).length;
+        sub = late ? late + ' overdue' : 'none overdue';
+      }
+      var tone = k.tone;
+      if ((k.key === 'urgent' || k.key === 'blocked') && !list.length) tone = 't-neu';
+      return '<button class="kpi ' + tone + '" type="button" data-kpi="' + k.key + '" aria-pressed="' + (S.kpi === k.key && S.scope === 'active') + '">' +
+        '<div class="k-label">' + esc(k.label) + '</div><div class="k-val">' + list.length + '</div><div class="k-sub">' + esc(sub) + '</div></button>';
+    }).join('');
+  }
+
+  function renderBreakdown() {
+    var active = allAxos().filter(function (a) { return !a.closed; });
+    var order = [NO_UPDATE].concat(S.data.statuses), counts = {};
+    active.forEach(function (a) { counts[a.status] = (counts[a.status] || 0) + 1; });
+    var total = active.length || 1;
+    $('stack').innerHTML = order.filter(function (s) { return counts[s]; }).map(function (s) {
+      var c = s === NO_UPDATE ? 'var(--line-strong)' : STATUS_COLOR[s];
+      var ink = s === NO_UPDATE ? 'var(--fg)' : '#fff';
+      return '<button type="button" data-status="' + esc(s) + '" title="' + esc(s) + ': ' + counts[s] + '" style="flex:' + counts[s] / total + ';background:' + c + ';color:' + ink + '">' + counts[s] + '</button>';
+    }).join('');
+    $('legend').innerHTML = order.map(function (s) {
+      var c = s === NO_UPDATE ? 'var(--line-strong)' : STATUS_COLOR[s];
+      return '<button type="button" data-status="' + esc(s) + '"><i style="background:' + c + '"></i>' + esc(s) + ' <b>' + (counts[s] || 0) + '</b></button>';
+    }).join('');
+  }
+
+  function renderWorkload() {
+    var per = {};
+    allAxos().forEach(function (a) {
+      a.qas.forEach(function (q) {
+        per[q] = per[q] || { active: 0, closed: 0 };
+        per[q][a.closed ? 'closed' : 'active']++;
+      });
+    });
+    var names = Object.keys(per).sort(function (x, y) {
+      return (per[y].active + per[y].closed) - (per[x].active + per[x].closed) || x.localeCompare(y);
+    });
+    if (!names.length) { $('workload').innerHTML = '<div class="wl-empty">No QA updates yet.</div>'; return; }
+    var max = Math.max.apply(null, names.map(function (n) { return per[n].active + per[n].closed; }));
+    var sel = $('f-qa').value;
+    $('workload').innerHTML = names.map(function (n) {
+      var p = per[n], tot = p.active + p.closed;
+      return '<button class="wl-row" type="button" data-qa="' + esc(n) + '" aria-pressed="' + (sel === n) + '">' +
+        '<span class="wl-name">' + esc(n) + '</span>' +
+        '<span class="wl-track"><span class="wl-bar" style="width:' + (tot / max * 100) + '%">' +
+        (p.active ? '<i class="g-ip" style="flex:' + p.active + '"></i>' : '') +
+        (p.closed ? '<i class="g-co" style="flex:' + p.closed + '"></i>' : '') +
+        '</span></span><span class="wl-num"><b>' + tot + '</b>' + p.active + ' active · ' + p.closed + ' closed</span></button>';
+    }).join('');
+  }
+
+  function sortVal(a, key) {
+    switch (key) {
+      case 'axo': return Number(a.axoNumber) || 0;
+      case 'title': return (a.title || '').toLowerCase();
+      case 'prio': return PRIO_RANK[a.prio];
+      case 'due': return a.dueIn === null ? 1e9 : a.dueIn;
+      case 'status': return a.status;
+      case 'updated': return a.lastAt;
+    }
+    return '';
+  }
+
+  function statusCell(a) {
+    if (!a.latest) return '<span class="wf st-none">' + NO_UPDATE + '</span>';
+    var u = a.latest;
+    return '<span class="wf ' + (STATUS_CLASS[u.status] || '') + '">' + esc(u.status) + '</span>' +
+      '<span class="st-sub"><b>' + esc(u.qa) + '</b> · ' + esc(fmtDay(u.shiftDate)) + ' ' + esc(u.shift) + '</span>';
+  }
+  function dueCell(a) {
+    if (!a.dueDate) return a.dueDateRaw ? '<span class="due">' + esc(a.dueDateRaw) + '</span>' : '<span class="muted">—</span>';
+    var cls = '', note = '';
+    if (!a.closed) {
+      if (a.dueIn < 0) { cls = 'late'; note = Math.abs(a.dueIn) + ' day' + (a.dueIn === -1 ? '' : 's') + ' overdue'; }
+      else if (a.dueIn === 0) { cls = 'soon'; note = 'today'; }
+      else if (a.dueIn <= 2) { cls = 'soon'; note = 'in ' + a.dueIn + ' day' + (a.dueIn === 1 ? '' : 's'); }
+      else note = 'in ' + a.dueIn + ' days';
+    }
+    return '<span class="due ' + cls + '">' + esc(fmtDay(a.dueDate)) + (note ? '<small>' + note + '</small>' : '') + '</span>';
+  }
+  function peopleHtml(a) {
+    var bits = [];
+    bits.push('<span><em class="dev">Dev</em>' + (a.devAssignees.length ? esc(a.devAssignees.join(', ')) : '<span class="none">Not assigned yet</span>') + '</span>');
+    if (a.raisedBy) bits.push('<span><em>Raised by</em>' + esc(a.raisedBy) + '</span>');
+    return '<div class="people">' + bits.join('') + '</div>';
+  }
+
+  function renderRows() {
+    var f = readFilters(), m = me();
+    var list = allAxos().filter(function (a) { return matches(a, f); });
+    var k = S.sort.key, dir = S.sort.dir;
+    list.sort(function (x, y) {
+      var a = sortVal(x, k), b = sortVal(y, k);
+      return (a < b ? -1 : a > b ? 1 : 0) * dir || (Number(y.axoNumber) - Number(x.axoNumber));
+    });
+    document.querySelectorAll('thead th[data-sort]').forEach(function (th) {
+      if (th.getAttribute('data-sort') === k) {
+        th.setAttribute('aria-sort', dir > 0 ? 'ascending' : 'descending');
+        th.querySelector('.arr').textContent = dir > 0 ? '▴' : '▾';
+      } else { th.removeAttribute('aria-sort'); th.querySelector('.arr').textContent = '▾'; }
+    });
+
+    if (!list.length) {
+      var none = allAxos().length ? 'No AXOs match these filters.' :
+        (S.data.slack.configured ? 'No AXOs yet. They appear here after the next Slack sync.' : 'No AXOs yet. Use Paste AXO to add one from Slack.');
+      $('rows').innerHTML = '<tr><td colspan="8" class="empty">' + none + '</td></tr>';
+    } else {
+      $('rows').innerHTML = list.map(function (a) {
+        var link = safeUrl(a.link);
+        var chips = [];
+        if (a.client) chips.push('<span class="chip client">' + esc(a.client) + '</span>');
+        if (a.ticketNumber) chips.push('<span class="chip">Ticket ' + esc(a.ticketNumber) + '</span>');
+        if (a.closed) chips.push('<span class="chip closed">Closed</span>');
+        var mine = a.qas.indexOf(m) >= 0;
+        return '<tr class="' + (a.prio === 'Urgent' || a.status === 'Urgent/High Prio' ? 'is-hp' : '') + '" data-axo="' + esc(a.axoNumber) + '">' +
+          '<td><button class="id-link" type="button" data-open="' + esc(a.axoNumber) + '">' + esc(a.axoNumber) + '</button>' +
+          (link ? '<a class="ext q-tag" href="' + esc(link) + '" target="_blank" rel="noopener">Axosoft ↗</a>' : '') + '</td>' +
+          '<td class="c-name"><span class="nm" data-open="' + esc(a.axoNumber) + '">' + esc(a.title || '(no title)') + '</span>' +
+          (chips.length ? '<div class="sub">' + chips.join('') + '</div>' : '') + peopleHtml(a) + '</td>' +
+          '<td><span class="prio ' + a.prio + '">' + esc(a.priority || '—') + '</span></td>' +
+          '<td>' + dueCell(a) + '</td>' +
+          '<td>' + statusCell(a) + '</td>' +
+          '<td><div class="qa-names">' + (a.qas.length ? a.qas.map(function (q) {
+            return '<span class="' + (q === m ? 'me-chip' : '') + '">' + esc(q) + '</span>';
+          }).join('') : '<span class="muted" style="background:none;padding:0">—</span>') + '</div></td>' +
+          '<td>' + (a.latest && a.latest.notes ? '<div class="snippet">' + esc(a.latest.notes) + '</div>' : '<span class="muted">—</span>') + '</td>' +
+          '<td><button class="upd-btn' + (mine ? ' mine' : '') + '" type="button" data-update="' + esc(a.axoNumber) + '">Update</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+    var scopeName = S.scope === 'all' ? 'all' : S.scope;
+    $('count').textContent = list.length + ' of ' + allAxos().filter(inScope).length + ' ' + scopeName + ' AXOs';
+  }
+
+  /* ---------- drawer ---------- */
+  function openDrawer(num) {
+    S.openAxo = num;
+    renderDrawer();
+    $('drawer').hidden = false; $('scrim').hidden = false;
+  }
+  function closeDrawer() {
+    S.openAxo = '';
+    $('drawer').hidden = true; $('scrim').hidden = true;
+  }
+  function renderDrawer() {
+    var a = S.byNum[S.openAxo];
+    if (!a) { closeDrawer(); return; }
+    var m = me();
+    $('d-num').textContent = 'AXO ' + a.axoNumber;
+    $('d-state').innerHTML = a.closed ? '<span class="chip closed">Closed</span>' : '';
+    var link = safeUrl(a.link);
+    $('d-link').hidden = !link; if (link) $('d-link').href = link;
+    $('d-toggle').textContent = a.closed ? 'Reopen' : 'Close';
+    $('d-title').textContent = a.title || '(no title)';
+    $('d-people').innerHTML = peopleHtml(a).replace(/^<div class="people">|<\/div>$/g, '');
+
+    $('d-updates').innerHTML = a.updates.length ? a.updates.map(function (u) {
+      var links = (u.files || []).map(function (f) {
+        var url = safeUrl(f.url);
+        return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(f.name || url) + '</a>' : '';
+      }).join('');
+      var own = u.qa === m;
+      return '<li class="note' + (own ? ' mine' : '') + '">' +
+        '<div class="note-meta"><span class="wf ' + (STATUS_CLASS[u.status] || '') + '">' + esc(u.status) + '</span>' +
+        '<b>' + esc(u.qa) + '</b><span>' + esc(fmtDay(u.shiftDate)) + ' · ' + esc(u.shift) + ' shift</span>' +
+        (own ? '<span class="acts"><button class="linkish" type="button" data-edit="' + esc(u.id) + '">Edit</button>' +
+          '<button class="linkish" type="button" data-del="' + esc(u.id) + '" style="color:var(--bad)">Delete</button></span>' : '') +
+        '</div>' + (u.notes ? '<p>' + esc(u.notes) + '</p>' : '') + (links ? '<div class="links">' + links + '</div>' : '') + '</li>';
+    }).join('') : '<li class="muted">No QA updates yet. Be the first.</li>';
+
+    var facts = [
+      ['Priority', a.priority ? '<span class="prio ' + a.prio + '">' + esc(a.priority) + '</span>' : '—'],
+      ['Due date', a.dueDate ? dueCell(a) : esc(a.dueDateRaw || '—')],
+      ['Client', esc(a.client || '—')],
+      ['Ticket', esc(a.ticketNumber || '—')],
+      ['Raised by', esc(a.raisedBy || '—')],
+      ['Dev', esc(a.devAssignees.join(', ') || 'Not assigned yet')],
+      ['Posted', a.postedAt ? esc(new Date(a.postedAt).toLocaleString()) : '—'],
+      ['Added from', '<span class="chip src">' + esc(a.source === 'paste' ? 'Paste' : 'Slack') + '</span>']
+    ];
+    if (a.closed && a.closedAt) facts.push(['Closed', esc(new Date(a.closedAt).toLocaleString())]);
+    $('d-facts').innerHTML = facts.map(function (f) { return '<dt>' + f[0] + '</dt><dd>' + f[1] + '</dd>'; }).join('');
+    $('d-info-wrap').hidden = !a.additionalInfo;
+    $('d-info').textContent = a.additionalInfo || '';
+  }
+
+  /* ---------- update dialog ---------- */
+  function requireMe() {
+    if (me()) return true;
+    var lab = $('me-select').parentNode;
+    lab.classList.remove('nudge'); void lab.offsetWidth; lab.classList.add('nudge');
+    $('me-select').focus();
+    toast('Pick your name at the top first.', true);
+    return false;
+  }
+  function axoLabel(a) { return a.axoNumber + ' - ' + (a.title || ''); }
+  function linkRow(name, url) {
+    var div = document.createElement('div');
+    div.className = 'link-row';
+    div.innerHTML = '<input placeholder="Label (optional)" class="lk-name"><input placeholder="https://drive.google.com/…" class="lk-url" type="url">' +
+      '<button class="btn btn-sm btn-quiet" type="button" aria-label="Remove link">✕</button>';
+    div.querySelector('.lk-name').value = name || '';
+    div.querySelector('.lk-url').value = url || '';
+    div.querySelector('button').onclick = function () { div.remove(); };
+    $('upd-links').appendChild(div);
+  }
+  function openUpdate(axoNum, update) {
+    if (!requireMe()) return;
+    S.editId = update ? update.id : '';
+    var cs = currentShift();
+    fillSelect($('upd-status'), S.data.statuses);
+    fillSelect($('upd-shift'), S.data.shifts);
+    $('axo-options').innerHTML = allAxos().filter(function (a) { return !a.closed; })
+      .sort(function (x, y) { return Number(y.axoNumber) - Number(x.axoNumber); })
+      .map(function (a) { return '<option value="' + esc(axoLabel(a)) + '"></option>'; }).join('');
+    var a = axoNum ? S.byNum[axoNum] : null;
+    $('upd-axo').value = a ? axoLabel(a) : '';
+    $('upd-axo-wrap').hidden = !!a;
+    $('upd-title').textContent = update ? 'Edit update' : 'Add update';
+    $('upd-sub').textContent = a ? 'AXO ' + a.axoNumber + ' · ' + (a.title || '') : 'Pick the AXO you worked on.';
+    $('upd-qa').value = update ? update.qa : me();
+    $('upd-status').value = update ? update.status : (a && a.latest ? a.latest.status : 'In Progress');
+    $('upd-date').value = update ? update.shiftDate : cs.date;
+    $('upd-shift').value = update ? update.shift : cs.shift;
+    $('upd-notes').value = update ? update.notes : '';
+    $('upd-links').innerHTML = '';
+    (update ? update.files : []).forEach(function (f) { linkRow(f.name, f.url); });
+    if (!$('upd-links').children.length) linkRow();
+    $('upd-err').hidden = true;
+    $('upd-dlg').showModal();
+    (a ? $('upd-notes') : $('upd-axo')).focus();
+  }
+  function resolveAxo(text) {
+    var m = String(text || '').match(/\d{3,}/);
+    return m && S.byNum[m[0]] ? m[0] : '';
+  }
+  function saveUpdate(ev) {
+    ev.preventDefault();
+    var num = resolveAxo($('upd-axo').value);
+    var err = $('upd-err');
+    if (!num) { err.textContent = 'Pick an AXO from the list.'; err.hidden = false; return; }
+    var payload = {
+      axoNumber: num, qa: $('upd-qa').value, shiftDate: $('upd-date').value, shift: $('upd-shift').value,
+      status: $('upd-status').value, notes: $('upd-notes').value,
+      files: [].map.call($('upd-links').children, function (row) {
+        return { name: row.querySelector('.lk-name').value.trim(), url: row.querySelector('.lk-url').value.trim() };
+      }).filter(function (f) { return f.url; })
+    };
+    var bad = payload.files.filter(function (f) { return !safeUrl(f.url); });
+    if (bad.length) { err.textContent = 'Links must start with https://'; err.hidden = false; return; }
+    $('upd-save').disabled = true;
+    var p = S.editId ? call('apiEditUpdate', S.editId, payload) : call('apiAddUpdate', payload);
+    p.then(function (data) {
+      S.data = data; $('upd-dlg').close(); render();
+      toast(S.editId ? 'Update saved.' : 'Update added to AXO ' + num + '.');
+    }, function (e) { err.textContent = e.message; err.hidden = false; })
+      .then(function () { $('upd-save').disabled = false; });
+  }
+
+  /* ---------- paste dialog ---------- */
+  function openPaste() {
+    $('paste-text').value = ''; $('paste-preview').hidden = true; $('paste-err').hidden = true;
+    $('paste-save').disabled = true;
+    $('paste-dlg').showModal(); $('paste-text').focus();
+  }
+  function checkPaste() {
+    var text = $('paste-text').value;
+    $('paste-err').hidden = true;
+    if (!text.trim()) return;
+    call('apiParseAxo', text).then(function (a) {
+      if (!a) { $('paste-err').textContent = 'No AXO number found. Paste the whole Slack post, starting from "Axo Number".'; $('paste-err').hidden = false; $('paste-preview').hidden = true; $('paste-save').disabled = true; return; }
+      var exists = S.byNum[a.axoNumber];
+      var rows = [['AXO', esc(a.axoNumber)], ['Title', esc(a.title)], ['Priority', esc(a.priority || '—')], ['Link', esc(a.link || '—')],
+        ['Due date', esc(a.dueDate ? fmtDay(a.dueDate) : (a.dueDateRaw || '—'))], ['Client', esc(a.client || '—')],
+        ['Ticket', esc(a.ticketNumber || '—')], ['Raised by', esc(a.raisedBy || '—')], ['Dev', esc(a.devAssignees.join(', ') || '—')]];
+      $('paste-preview').innerHTML = (exists ? '<div class="tip"><b>Already in the tracker.</b> Saving fills in any blanks; it won\'t create a duplicate.</div>' : '') +
+        '<dl class="facts" style="margin-top:10px">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + r[1] + '</dd>'; }).join('') + '</dl>';
+      $('paste-preview').hidden = false;
+      $('paste-save').disabled = false;
+      $('paste-save').textContent = exists ? 'Update AXO' : 'Add AXO';
+    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; });
+  }
+  function savePaste(ev) {
+    ev.preventDefault();
+    $('paste-save').disabled = true;
+    call('apiPasteAxo', $('paste-text').value).then(function (r) {
+      $('paste-dlg').close();
+      toast(r.added ? 'AXO ' + r.axo.axoNumber + ' added.' : r.updated ? 'AXO ' + r.axo.axoNumber + ' updated.' : 'AXO ' + r.axo.axoNumber + ' was already up to date.');
+      return refresh().then(function () { openDrawer(r.axo.axoNumber); });
+    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; $('paste-save').disabled = false; });
+  }
+
+  /* ---------- data ---------- */
+  function refresh() {
+    return call('apiBootstrap').then(function (d) { S.data = d; render(); }, function (e) { toast(e.message, true); });
+  }
+
+  /* ---------- events ---------- */
+  function wire() {
+    $('me-select').onchange = function () { store('npdqa.me', this.value); render(); };
+    $('add-btn').onclick = function () { openUpdate(''); };
+    $('paste-btn').onclick = openPaste;
+    $('help-btn').onclick = function () { $('help-dlg').showModal(); };
+    $('help-close').onclick = function () { $('help-dlg').close(); };
+    $('sync-btn').onclick = function () {
+      var b = this; b.disabled = true; $('sync').className = 'sync busy'; $('sync-text').textContent = 'Syncing…';
+      call('apiSyncNow').then(function (d) { S.data = d; render(); toast('Slack sync done.'); }, function (e) { toast(e.message, true); render(); })
+        .then(function () { b.disabled = false; });
+    };
+
+    ['f-q', 'f-status', 'f-qa', 'f-prio', 'f-client', 'f-mine', 'f-due', 'f-none'].forEach(function (id) {
+      $(id).addEventListener(id === 'f-q' ? 'input' : 'change', function () { saveFilters(); renderRows(); renderWorkload(); });
+    });
+    $('f-clear').onclick = function () {
+      $('f-q').value = ''; ['f-status', 'f-qa', 'f-prio', 'f-client'].forEach(function (id) { $(id).value = ''; });
+      ['f-mine', 'f-due', 'f-none'].forEach(function (id) { $(id).checked = false; });
+      S.kpi = ''; saveFilters(); render();
+    };
+    $('scope-tabs').onclick = function (e) {
+      var b = e.target.closest('[data-scope]'); if (!b) return;
+      S.scope = b.getAttribute('data-scope'); if (S.scope !== 'active') S.kpi = '';
+      saveFilters(); render();
+    };
+    $('kpis').onclick = function (e) {
+      var b = e.target.closest('[data-kpi]'); if (!b) return;
+      var k = b.getAttribute('data-kpi');
+      S.scope = 'active'; S.kpi = S.kpi === k ? '' : k; saveFilters(); render();
+    };
+    function statusClick(e) {
+      var b = e.target.closest('[data-status]'); if (!b) return;
+      var s = b.getAttribute('data-status');
+      S.scope = 'active'; $('f-status').value = $('f-status').value === s ? '' : s; saveFilters(); render();
+    }
+    $('stack').onclick = statusClick; $('legend').onclick = statusClick;
+    $('workload').onclick = function (e) {
+      var b = e.target.closest('[data-qa]'); if (!b) return;
+      var q = b.getAttribute('data-qa');
+      $('f-qa').value = $('f-qa').value === q ? '' : q; saveFilters(); renderRows(); renderWorkload();
+    };
+    document.querySelector('thead').onclick = function (e) {
+      var th = e.target.closest('th[data-sort]'); if (!th) return;
+      var k = th.getAttribute('data-sort');
+      S.sort = S.sort.key === k ? { key: k, dir: -S.sort.dir } : { key: k, dir: k === 'title' || k === 'due' || k === 'prio' ? 1 : -1 };
+      saveFilters(); renderRows();
+    };
+    $('rows').onclick = function (e) {
+      var o = e.target.closest('[data-open]'); if (o) { openDrawer(o.getAttribute('data-open')); return; }
+      var u = e.target.closest('[data-update]'); if (u) openUpdate(u.getAttribute('data-update'));
+    };
+
+    $('scrim').onclick = closeDrawer; $('d-close').onclick = closeDrawer;
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('drawer').hidden && !document.querySelector('dialog[open]')) closeDrawer(); });
+    $('d-add').onclick = function () { openUpdate(S.openAxo); };
+    $('d-toggle').onclick = function () {
+      var a = S.byNum[S.openAxo]; if (!a || !requireMe()) return;
+      var b = this; b.disabled = true;
+      call('apiSetAxoState', a.axoNumber, a.closed ? 'Active' : 'Closed').then(function (d) {
+        S.data = d; render(); toast('AXO ' + a.axoNumber + (a.closed ? ' reopened.' : ' closed.'));
+      }, function (e) { toast(e.message, true); }).then(function () { b.disabled = false; });
+    };
+    $('d-updates').onclick = function (e) {
+      var a = S.byNum[S.openAxo]; if (!a) return;
+      var ed = e.target.closest('[data-edit]');
+      if (ed) {
+        var u = a.updates.filter(function (x) { return x.id === ed.getAttribute('data-edit'); })[0];
+        if (u) openUpdate(a.axoNumber, u);
+        return;
+      }
+      var del = e.target.closest('[data-del]');
+      if (del) {
+        if (del.getAttribute('data-armed') !== '1') { del.setAttribute('data-armed', '1'); del.textContent = 'Click again to delete'; return; }
+        call('apiDeleteUpdate', del.getAttribute('data-del')).then(function (d) { S.data = d; render(); toast('Update deleted.'); }, function (er) { toast(er.message, true); });
+      }
+    };
+
+    $('upd-form').addEventListener('submit', saveUpdate);
+    $('upd-cancel').onclick = function () { $('upd-dlg').close(); };
+    $('upd-add-link').onclick = function () { linkRow(); };
+    $('paste-form').addEventListener('submit', savePaste);
+    $('paste-cancel').onclick = function () { $('paste-dlg').close(); };
+    $('paste-check').onclick = checkPaste;
+    $('paste-text').addEventListener('paste', function () { setTimeout(checkPaste, 0); });
+
+    // Keep the list fresh while the tab is open (new AXOs arrive from Slack).
+    setInterval(function () {
+      if (document.visibilityState === 'visible' && !document.querySelector('dialog[open]')) refresh();
+    }, 120000);
+  }
+
+  wire();
+  loadFilters();
+  refresh();
+})();
+</script>
