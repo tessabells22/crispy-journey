@@ -101,11 +101,12 @@
     return Math.round(s / 86400) + ' d ago';
   }
   function prioClass(p) {
-    var s = String(p || '').toLowerCase();
-    if (/urgent|critical|blocker|p0/.test(s)) return 'Urgent';
-    if (/high|p1/.test(s)) return 'High';
-    if (/med|normal|p2/.test(s)) return 'Medium';
-    if (/low|p3|p4/.test(s)) return 'Low';
+    // Judge by the first word: the workflow prints e.g. "HIGH (showstopper/blocker/urgent)".
+    var s = String(p || '').toLowerCase().replace(/^[^a-z0-9]+/, '');
+    if (/^(urgent|critical|blocker|p0)/.test(s)) return 'Urgent';
+    if (/^(high|p1)/.test(s)) return 'High';
+    if (/^(med|normal|p2)/.test(s)) return 'Medium';
+    if (/^(low|p3|p4)/.test(s)) return 'Low';
     return '';
   }
   var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };

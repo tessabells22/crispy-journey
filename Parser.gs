@@ -163,7 +163,8 @@ function parseAxoPost(text, userNames) {
     var t = stripMarks_(line);
     if (!t) continue;
     // Thread chatter copied along with a paste ends the post.
-    if (/assigned\s+to\s+axo/i.test(t) || /^\d+\s+repl(y|ies)\b/i.test(t) || /^view thread$/i.test(t)) { current = null; continue; }
+    if (/assigned\s+to\s+axo/i.test(t) || /^\d+\s+repl(y|ies)\b/i.test(t) || /^view thread$/i.test(t) ||
+        /@(here|channel|everyone)\b/i.test(t) || /^please assign\b/i.test(t)) { current = null; continue; }
     // Single-value fields take one value line; only free text keeps folding.
     if (current === 'additionalInfo' || fields[current].length === 0) fields[current].push(t);
   }

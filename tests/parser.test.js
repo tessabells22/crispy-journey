@@ -104,4 +104,10 @@ t('mergeAxo keeps existing values over blanks and unions assignees', () => {
   assert.deepStrictEqual([...m.devAssignees], ['A', 'B']);
 });
 
+t('workflow footer is not read as a field value', () => {
+  const a = P.parseAxoPost('*Axo Number:*\n15612 - [Frontend] - Bug AXO: X\n*Client:*\nEntrust\n*Ticket Number:*\n\nPlease assign a resource <!here>');
+  assert.strictEqual(a.client, 'Entrust');
+  assert.strictEqual(a.ticketNumber, '');
+});
+
 console.log(n + ' tests passed');
