@@ -6,18 +6,21 @@ new ones come in by themselves from the **#axo-assignments** Slack channel (post
 **Paste AXO**, which reads a copied Slack post with the same parser.
 
 This is a separate project from the NPD QA Endorsement Tracker. It has its own Sheet,
-its own Apps Script project and its own deployment, and shares nothing with it. The look
-follows the Carrier Compliance QA AXO Monitoring Tracker.
+its own Apps Script project and its own deployment, and shares nothing with it. It uses the
+ShipERP colours with its own layout: a shift header, queues, AXO cards and a side panel with
+the update form and history.
 
 ## What QAs do
 
-1. Pick their name under **You** (remembered per browser).
-2. Find the AXO they worked on and click **Update** (or **Add update** at the top).
-3. Record status, shift date, shift (Day / Mid / Night), notes and test file links.
+1. Pick their name at the top right (remembered per browser).
+2. Open the AXO they worked on from a queue (**Needs a QA**, **My AXOs**, **Due in 2 days**,
+   **Blocked or failing**, ...), or use **Add update** at the top.
+3. In the side panel, record status, shift date, shift (Day / Mid / Night), notes and test
+   file links. The shift date and shift default to the current Manila shift.
 
 Every update is kept, so an AXO shows its full history and everyone who worked on it.
 Several QAs can update the same AXO. An update with **Passed - Develop/Deployment** closes
-the AXO; **Reopen** in the AXO panel brings it back.
+the AXO; **Reopen** in the AXO panel brings it back, and **Mark closed** closes one by hand.
 
 Statuses: Not Tested, In Progress, Passed - Initial, Passed - Develop/Deployment,
 Failed - Initial, Failed - Develop/Deployment, Needs Monitoring, Urgent/High Prio, Blocked.
