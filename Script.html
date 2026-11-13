@@ -1,0 +1,613 @@
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- state ---------- */
+  var S = {
+    data: null,        // apiBootstrap() result
+    byNum: {},         // axoNumber -> derived AXO
+    queue: 'active',   // see QUEUES
+    qa: '',            // team filter
+    open: '',          // AXO shown in the detail panel
+    composerFor: '',   // AXO the update form was built for
+    editId: '',        // update being edited ('' = new)
+    dirty: false       // unsaved text in the update form
+  };
+
+  var STATUS_VAR = {
+    'Not Tested': '--s-new', 'In Progress': '--s-prog', 'Passed - Initial': '--s-pi',
+    'Passed - Develop/Deployment': '--s-pd', 'Failed - Initial': '--s-fi', 'Failed - Develop/Deployment': '--s-fd',
+    'Needs Monitoring': '--s-mon', 'Urgent/High Prio': '--s-urg', 'Blocked': '--s-blk'
+  };
+  function sColor(s) { return STATUS_VAR[s] ? 'var(' + STATUS_VAR[s] + ')' : 'var(--line-strong)'; }
+
+  var QUEUES = [
+    { key: 'needs', label: 'Needs a QA', color: 'var(--orange)', test: function (a) { return !a.closed && !a.latest; } },
+    { key: 'mine', label: 'My AXOs', color: 'var(--brand)', test: function (a) { return !a.closed && a.qas.indexOf(me()) >= 0; } },
+    { key: 'due', label: 'Due in 2 days', color: 'var(--warn)', alert: true, test: function (a) { return !a.closed && a.dueIn !== null && a.dueIn <= 2; } },
+    { key: 'attention', label: 'Blocked or failing', color: 'var(--bad)', alert: true, test: function (a) { return !a.closed && (a.status === 'Blocked' || a.status === 'Urgent/High Prio' || /^Failed/.test(a.status)); } },
+    { key: 'monitor', label: 'Needs monitoring', color: 'var(--s-mon)', test: function (a) { return !a.closed && a.status === 'Needs Monitoring'; } },
+    { key: 'active', label: 'All active', color: 'var(--sky)', test: function (a) { return !a.closed; } },
+    { key: 'closed', label: 'Closed', color: 'var(--ok)', test: function (a) { return a.closed; } }
+  ];
+  function queueDef(k) { return QUEUES.filter(function (q) { return q.key === k; })[0] || QUEUES[5]; }
+
+  /* ---------- helpers ---------- */
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function safeUrl(u) { return /^https?:\/\//i.test(String(u || '')) ? String(u) : ''; }
+  function store(key, v) {
+    try { if (v === undefined) return localStorage.getItem(key) || ''; localStorage.setItem(key, v); } catch (e) {}
+    return '';
+  }
+  function toast(msg, err) {
+    var t = $('toast');
+    t.textContent = msg; t.className = 'toast' + (err ? ' err' : ''); t.hidden = false;
+    clearTimeout(toast._t); toast._t = setTimeout(function () { t.hidden = true; }, err ? 6000 : 3000);
+  }
+  function call(fn) {
+    var args = [].slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var r = google.script.run.withSuccessHandler(resolve).withFailureHandler(function (e) {
+        reject(e && e.message ? e : new Error(String(e)));
+      });
+      r[fn].apply(r, args);
+    });
+  }
+  function me() { return store('npdqa.me'); }
+
+  function initials(name) {
+    var p = String(name || '?').replace(/[^A-Za-z0-9 ]/g, ' ').trim().split(/\s+/);
+    return ((p[0] || '?').charAt(0) + (p.length > 1 ? p[p.length - 1].charAt(0) : (p[0] || '').charAt(1) || '')).toUpperCase();
+  }
+  function avatar(name, cls) {
+    var h = 0; String(name).split('').forEach(function (c) { h = (h * 31 + c.charCodeAt(0)) >>> 0; });
+    return '<span class="av ' + (cls || '') + (name === me() ? ' me-av' : '') + '" style="--c:var(--a' + (h % 6 + 1) + ')" title="' + esc(name) + '">' + esc(initials(name)) + '</span>';
+  }
+
+  /* Manila time, and the shift that is on now. */
+  function manilaNow() {
+    var parts = {};
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' })
+      .formatToParts(new Date()).forEach(function (p) { parts[p.type] = p.value; });
+    return { date: parts.year + '-' + parts.month + '-' + parts.day, hour: Number(parts.hour) };
+  }
+  function addDays(iso, n) {
+    var d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+  function currentShift() {
+    var m = manilaNow();
+    if (m.hour >= 5 && m.hour <= 12) return { date: m.date, shift: 'Day' };
+    if (m.hour >= 13 && m.hour <= 21) return { date: m.date, shift: 'Mid' };
+    return { date: m.hour < 5 ? addDays(m.date, -1) : m.date, shift: 'Night' };
+  }
+  function shiftRank(s) { return s === 'Day' ? 0 : s === 'Mid' ? 1 : s === 'Night' ? 2 : 3; }
+  function fmtDay(iso, withYear) {
+    if (!/^\d{4}-\d{2}-\d{2}/.test(iso || '')) return iso || '';
+    var d = new Date(iso.slice(0, 10) + 'T00:00:00Z');
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: withYear ? 'numeric' : undefined, timeZone: 'UTC' });
+  }
+  function ago(iso) {
+    if (!iso) return '';
+    var s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' d ago';
+  }
+  function prioClass(p) {
+    // Judge by the first word: the workflow prints e.g. "HIGH (showstopper/blocker/urgent)".
+    var s = String(p || '').toLowerCase().replace(/^[^a-z0-9]+/, '');
+    if (/^(urgent|critical|blocker|p0)/.test(s)) return 'Urgent';
+    if (/^(high|p1)/.test(s)) return 'High';
+    if (/^(med|normal|p2)/.test(s)) return 'Medium';
+    if (/^(low|p3|p4)/.test(s)) return 'Low';
+    return '';
+  }
+  function shortPrio(p) { var w = String(p || '').trim().split(/[\s(]/)[0]; return w || String(p || ''); }
+  var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };
+
+  /* ---------- derive ---------- */
+  function derive() {
+    var byNum = {};
+    S.data.axos.forEach(function (a) { byNum[a.axoNumber] = Object.assign({}, a, { updates: [], qas: [] }); });
+    S.data.updates.forEach(function (u) { if (byNum[u.axoNumber]) byNum[u.axoNumber].updates.push(u); });
+    var today = manilaNow().date;
+    Object.keys(byNum).forEach(function (k) {
+      var a = byNum[k];
+      a.updates.sort(function (x, y) {
+        return (y.shiftDate || '').localeCompare(x.shiftDate || '') || shiftRank(y.shift) - shiftRank(x.shift) ||
+          (y.createdAt || '').localeCompare(x.createdAt || '');
+      });
+      a.latest = a.updates[0] || null;
+      a.status = a.latest ? a.latest.status : '';
+      var seen = {};
+      a.updates.slice().reverse().forEach(function (u) { if (u.qa && !seen[u.qa]) { seen[u.qa] = 1; a.qas.push(u.qa); } });
+      a.prio = prioClass(a.priority);
+      a.closed = a.state === 'Closed';
+      a.dueIn = a.dueDate ? Math.round((new Date(a.dueDate + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 864e5) : null;
+      a.lastKey = a.latest ? a.latest.shiftDate + shiftRank(a.latest.shift) + a.latest.createdAt : '';
+    });
+    S.byNum = byNum;
+  }
+  function all() { return Object.keys(S.byNum).map(function (k) { return S.byNum[k]; }); }
+
+  /* ---------- header ---------- */
+  function renderHeader() {
+    var cs = currentShift(), m = me();
+    var d = new Date(cs.date + 'T00:00:00Z');
+    $('shift-line').textContent = cs.shift + ' shift · ' + d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
+    var needs = all().filter(queueDef('needs').test).length;
+    var lead = m ? 'Hi ' + esc(m.split(/\s|-/)[0]) + ', ' : '';
+    $('headline').innerHTML = !m ? 'Pick your name to start logging updates.' :
+      needs ? lead + '<em>' + needs + ' AXO' + (needs === 1 ? '' : 's') + '</em> ' + (needs === 1 ? 'needs' : 'need') + ' a QA.' :
+      lead + 'every active AXO has a QA on it.';
+
+    var weekAgo = new Date(Date.now() - 7 * 864e5).toISOString();
+    var closedWeek = all().filter(function (a) { return a.closed && a.closedAt >= weekAgo; }).length;
+    var stats = [
+      ['active', all().filter(queueDef('active').test).length, 'active', ''],
+      ['needs', needs, 'need a QA', needs ? 'warm' : ''],
+      ['due', all().filter(queueDef('due').test).length, 'due in 2 days', ''],
+      ['attention', all().filter(queueDef('attention').test).length, 'blocked or failing', ''],
+      ['closed', closedWeek, 'closed this week', '']
+    ];
+    stats[2][3] = stats[2][1] ? 'warm' : ''; stats[3][3] = stats[3][1] ? 'hot' : '';
+    $('stats').innerHTML = stats.map(function (s) {
+      return '<button class="stat ' + s[3] + '" type="button" data-queue="' + s[0] + '"><b>' + s[1] + '</b><span>' + s[2] + '</span></button>';
+    }).join('');
+
+    var sl = S.data.slack, sync = $('sync'), txt, cls = 'sync';
+    if (!sl.configured) { txt = 'Slack not connected'; cls += ' err'; sync.title = 'Use Paste AXO to add AXOs'; }
+    else if (sl.lastError && sl.lastError.at && (!sl.lastSync.at || sl.lastError.at > sl.lastSync.at)) {
+      txt = 'Slack sync failed ' + ago(sl.lastError.at); cls += ' err can'; sync.title = (sl.lastError.error || '') + ' · click to retry';
+    } else { txt = sl.lastSync.at ? 'Synced ' + ago(sl.lastSync.at) : 'Waiting for first sync'; cls += ' can'; sync.title = 'Click to sync now'; }
+    sync.className = cls; $('sync-text').textContent = txt;
+
+    var names = S.data.qas.slice();
+    if (m && names.indexOf(m) < 0) names.push(m);
+    $('me-select').innerHTML = '<option value="">Pick your name</option>' + names.map(function (n) {
+      return '<option' + (n === m ? ' selected' : '') + '>' + esc(n) + '</option>';
+    }).join('');
+    $('me-wrap').classList.toggle('missing', !m);
+    $('me-av').outerHTML = m ? avatar(m, 'sm').replace('class="av', 'id="me-av" class="av') : '<span class="av sm" id="me-av" aria-hidden="true">?</span>';
+  }
+
+  /* ---------- rail ---------- */
+  function renderRail() {
+    $('queues').innerHTML = QUEUES.map(function (q) {
+      var n = all().filter(q.test).length;
+      if (q.key === 'mine' && !me()) n = 0;
+      return '<button class="queue' + (q.alert && n ? ' alert' : '') + '" type="button" data-queue="' + q.key + '" aria-current="' + (S.queue === q.key) + '" style="--q:' + q.color + '">' +
+        '<span class="ic"></span>' + esc(q.label) + '<span class="n">' + n + '</span></button>';
+    }).join('');
+
+    var per = {};
+    all().forEach(function (a) { a.qas.forEach(function (q) { per[q] = per[q] || { act: 0, tot: 0 }; per[q].tot++; if (!a.closed) per[q].act++; }); });
+    S.data.qas.forEach(function (q) { per[q] = per[q] || { act: 0, tot: 0 }; });
+    var names = Object.keys(per).sort(function (x, y) { return per[y].act - per[x].act || per[y].tot - per[x].tot || x.localeCompare(y); });
+    $('team').innerHTML = names.length ? names.map(function (n) {
+      return '<button class="mate" type="button" data-qa="' + esc(n) + '" aria-pressed="' + (S.qa === n) + '">' + avatar(n, 'sm') +
+        '<span class="who">' + esc(n) + '</span><span class="cnt">' + per[n].act + ' active</span></button>';
+    }).join('') : '<div class="rail-empty">Add QA names in the QAs tab.</div>';
+  }
+
+  /* ---------- board ---------- */
+  function fillSelect(sel, opts) {
+    var v = sel.value || sel.getAttribute('data-want') || '';
+    sel.innerHTML = opts.map(function (o) { return '<option value="' + esc(o[0]) + '">' + esc(o[1]) + '</option>'; }).join('');
+    sel.value = v; if (sel.selectedIndex < 0) sel.selectedIndex = 0;
+    sel.removeAttribute('data-want');
+  }
+  function renderToolbar() {
+    fillSelect($('f-prio'), [['', 'Any priority'], ['Urgent', 'Urgent'], ['High', 'High'], ['Medium', 'Medium'], ['Low', 'Low'], ['(none)', 'Not set']]);
+    var clients = {}; all().forEach(function (a) { if (a.client) clients[a.client] = 1; });
+    fillSelect($('f-client'), [['', 'Any client']].concat(Object.keys(clients).sort().map(function (c) { return [c, c]; })));
+  }
+
+  function filtered() {
+    var q = $('f-q').value.trim().toLowerCase(), prio = $('f-prio').value, client = $('f-client').value;
+    var qd = queueDef(S.queue);
+    var list = all().filter(function (a) {
+      if (!qd.test(a)) return false;
+      if (S.qa && a.qas.indexOf(S.qa) < 0) return false;
+      if (prio && (prio === '(none)' ? a.prio !== '' : a.prio !== prio)) return false;
+      if (client && a.client !== client) return false;
+      if (q) {
+        var hay = [a.axoNumber, a.title, a.client, a.ticketNumber, a.raisedBy, a.devAssignees.join(' '), a.qas.join(' ')].join(' ').toLowerCase();
+        if (hay.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+    var sort = $('f-sort').value;
+    list.sort(function (x, y) {
+      var r = 0;
+      if (sort === 'due') r = (x.dueIn === null ? 1e9 : x.dueIn) - (y.dueIn === null ? 1e9 : y.dueIn) || PRIO_RANK[x.prio] - PRIO_RANK[y.prio];
+      else if (sort === 'prio') r = PRIO_RANK[x.prio] - PRIO_RANK[y.prio] || (x.dueIn === null ? 1e9 : x.dueIn) - (y.dueIn === null ? 1e9 : y.dueIn);
+      else if (sort === 'updated') r = (y.lastKey || '').localeCompare(x.lastKey || '');
+      return r || Number(y.axoNumber) - Number(x.axoNumber);
+    });
+    return list;
+  }
+
+  function dueHtml(a) {
+    if (!a.dueDate) return a.dueDateRaw ? '<span class="due">Due ' + esc(a.dueDateRaw) + '</span>' : '';
+    if (a.closed) return '<span class="due">Due ' + esc(fmtDay(a.dueDate)) + '</span>';
+    var cls = '', t;
+    if (a.dueIn < 0) { cls = 'late'; t = Math.abs(a.dueIn) + 'd overdue'; }
+    else if (a.dueIn === 0) { cls = 'soon'; t = 'Due today'; }
+    else if (a.dueIn === 1) { cls = 'soon'; t = 'Due tomorrow'; }
+    else { cls = a.dueIn <= 2 ? 'soon' : ''; t = 'Due ' + fmtDay(a.dueDate) + ' · ' + a.dueIn + 'd'; }
+    return '<span class="due ' + cls + '">' + t + '</span>';
+  }
+  function statusPill(s) {
+    return s ? '<span class="pill" style="--c:' + sColor(s) + '">' + esc(s) + '</span>' : '<span class="pill none">No QA yet</span>';
+  }
+  function trail(a) {
+    var ups = a.updates.slice(0, 8).reverse();
+    if (!ups.length) return '';
+    return '<span class="trail" aria-label="' + a.updates.length + ' updates">' + (a.updates.length > 8 ? '<span class="more">+' + (a.updates.length - 8) + '</span>' : '') +
+      ups.map(function (u) { return '<i style="--c:' + sColor(u.status) + '" title="' + esc(u.status + ' · ' + u.qa + ' · ' + fmtDay(u.shiftDate) + ' ' + u.shift) + '"></i>'; }).join('') + '</span>';
+  }
+
+  function renderBoard() {
+    var qd = queueDef(S.queue), list = filtered();
+    $('board-title').innerHTML = esc(qd.label) + (S.qa ? ' <small>worked by ' + esc(S.qa) + ' · <button class="linkish" type="button" id="clear-qa">clear</button></small>' : '');
+    if (!list.length) {
+      var msg = !all().length
+        ? (S.data.slack.configured ? '<b>No AXOs yet</b>They show up here after the next Slack sync.' : '<b>No AXOs yet</b>Use Paste AXO to add one from Slack.')
+        : S.queue === 'needs' && !$('f-q').value && !S.qa ? '<b>All caught up</b>Every active AXO has at least one QA update.'
+        : '<b>Nothing here</b>No AXOs match this queue and these filters.';
+      $('cards').innerHTML = '<div class="empty">' + msg + '</div>';
+    } else {
+      $('cards').innerHTML = list.map(function (a) {
+        var meta = [];
+        if (a.client) meta.push('<span class="tag client">' + esc(a.client) + '</span>');
+        if (a.ticketNumber) meta.push('<span><span class="k">Ticket</span> ' + esc(a.ticketNumber) + '</span>');
+        meta.push('<span><span class="k">Dev</span> ' + (a.devAssignees.length ? esc(a.devAssignees.join(', ')) : 'not assigned') + '</span>');
+        var dh = dueHtml(a); if (dh) meta.push(dh);
+        var note = a.latest && a.latest.notes ? '<div class="c-note"><b>' + esc(a.latest.qa) + ':</b> ' + esc(a.latest.notes) + '</div>' : '';
+        return '<article class="card' + (a.closed ? ' closed' : '') + '" data-open="' + esc(a.axoNumber) + '" aria-current="' + (S.open === a.axoNumber) + '" style="--sc:' + (a.status ? sColor(a.status) : 'var(--orange)') + '" tabindex="0">' +
+          '<div class="c-top"><span class="c-num">' + esc(a.axoNumber) + '</span>' + (a.priority ? '<span class="prio ' + a.prio + '" title="' + esc(a.priority) + '">' + esc(shortPrio(a.priority)) + '</span>' : '') +
+          statusPill(a.status) + (a.closed ? '<span class="tag closed">Closed</span>' : '') + '</div>' +
+          '<div class="c-title">' + esc(a.title || '(no title)') + '</div>' +
+          '<div class="c-meta">' + meta.join('') + '</div>' +
+          '<div class="c-side">' + (a.qas.length ? '<span class="avs">' + a.qas.slice(0, 5).map(function (q) { return avatar(q); }).join('') + '</span>' : '') +
+          trail(a) + '<button class="upd-btn" type="button" data-update="' + esc(a.axoNumber) + '">Update</button></div>' + note + '</article>';
+      }).join('');
+    }
+    var total = all().filter(qd.test).length;
+    $('count').textContent = list.length === total ? list.length + ' AXO' + (list.length === 1 ? '' : 's') : list.length + ' of ' + total + ' AXOs';
+    $('build').textContent = 'Build ' + S.data.build;
+  }
+
+  /* ---------- detail panel ---------- */
+  function openDetail(num, focusForm) {
+    if (S.open !== num) { S.open = num; S.composerFor = ''; S.editId = ''; S.dirty = false; }
+    renderDetail();
+    renderBoard();
+    $('scrim').hidden = false;
+    if (focusForm) {
+      if (!requireMe()) return;
+      var n = document.querySelector('#detail textarea'); if (n) n.focus();
+    }
+  }
+  function closeDetail() {
+    if (S.dirty && !confirmDiscard()) return;
+    S.open = ''; S.composerFor = ''; S.editId = ''; S.dirty = false;
+    renderDetail(); renderBoard();
+  }
+  function confirmDiscard() {
+    var b = $('c-save');
+    if (b && b.getAttribute('data-warned') !== '1') {
+      b.setAttribute('data-warned', '1'); toast('You have an unsaved update. Close again to discard it.', true); return false;
+    }
+    return true;
+  }
+
+  function composerHtml(a, u) {
+    var cs = currentShift();
+    var status = u ? u.status : (a.latest ? a.latest.status : 'In Progress');
+    var date = u ? u.shiftDate : cs.date, shift = u ? u.shift : cs.shift;
+    var chips = S.data.statuses.map(function (s, i) {
+      return '<label><input type="radio" name="c-status" value="' + esc(s) + '"' + (s === status ? ' checked' : '') + '><span style="--c:' + sColor(s) + '">' + esc(s) + '</span></label>';
+    }).join('');
+    var seg = S.data.shifts.map(function (s) {
+      return '<label><input type="radio" name="c-shift" value="' + s + '"' + (s === shift ? ' checked' : '') + '><span>' + s + '</span></label>';
+    }).join('');
+    return '<form class="composer' + (u ? ' editing' : '') + '" id="composer">' +
+      '<div class="lbl">' + (u ? 'Editing your update' : 'Your update') + '</div>' +
+      '<div class="chips" role="radiogroup" aria-label="Status">' + chips + '</div>' +
+      '<div class="row2"><div class="fld"><span class="lbl">Shift date</span><input type="date" id="c-date" value="' + esc(date) + '"></div>' +
+      '<div class="fld"><span class="lbl">Shift</span><div class="seg" role="radiogroup" aria-label="Shift">' + seg + '</div></div></div>' +
+      '<div class="fld"><span class="lbl">Notes</span><textarea id="c-notes" placeholder="What you tested, what you found, what the next shift should know">' + esc(u ? u.notes : '') + '</textarea></div>' +
+      '<div class="fld"><span class="lbl">Test files and links</span><div class="link-rows" id="c-links"></div>' +
+      '<button class="linkish" type="button" id="c-add-link" style="align-self:flex-start">+ Add a link</button></div>' +
+      '<div class="err" id="c-err" hidden></div>' +
+      '<div class="c-foot"><span class="who">' + avatar(me(), 'sm') + esc(me()) + '</span>' +
+      (u ? '<button class="btn btn-sm btn-quiet" type="button" id="c-cancel">Cancel edit</button>' : '') +
+      '<button class="btn btn-primary btn-sm" type="submit" id="c-save">' + (u ? 'Save changes' : 'Save update') + '</button></div></form>';
+  }
+  function addLinkRow(name, url) {
+    var div = document.createElement('div');
+    div.className = 'link-row';
+    div.innerHTML = '<input placeholder="Label (optional)" class="lk-name" aria-label="Link label"><input placeholder="https://drive.google.com/…" class="lk-url" type="url" aria-label="Link URL">' +
+      '<button class="btn btn-sm btn-quiet" type="button" aria-label="Remove link">✕</button>';
+    div.querySelector('.lk-name').value = name || '';
+    div.querySelector('.lk-url').value = url || '';
+    div.querySelector('button').onclick = function () { div.remove(); };
+    $('c-links').appendChild(div);
+  }
+
+  function renderDetail() {
+    var el = $('detail'), shell = $('shell');
+    var a = S.byNum[S.open];
+    if (!a) {
+      S.open = '';
+      el.hidden = window.matchMedia('(max-width:1240px)').matches;
+      $('scrim').hidden = true;
+      shell.classList.toggle('no-detail', el.hidden);
+      el.innerHTML = '<div class="d-empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>' +
+        '<b>Pick an AXO</b>Its history, details and your update form show up here.</div>';
+      return;
+    }
+    el.hidden = false; shell.classList.remove('no-detail');
+
+    // Keep a half-typed update when the data refreshes in the background.
+    var keepComposer = S.composerFor === a.axoNumber && $('composer');
+    var saved = keepComposer ? $('composer') : null;
+
+    var link = safeUrl(a.link);
+    var people = [];
+    people.push('<span>Dev <b>' + (a.devAssignees.length ? esc(a.devAssignees.join(', ')) : 'not assigned') + '</b></span>');
+    if (a.raisedBy) people.push('<span>Raised by <b>' + esc(a.raisedBy) + '</b></span>');
+    if (a.client) people.push('<span>Client <b>' + esc(a.client) + '</b></span>');
+
+    var m = me();
+    var tl = a.updates.length ? a.updates.map(function (u) {
+      var links = (u.files || []).map(function (f) {
+        var url = safeUrl(f.url);
+        return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(f.name || url) + '</a>' : '';
+      }).join('');
+      var own = u.qa === m;
+      return '<li class="ev">' + avatar(u.qa) + '<div class="ev-meta"><b>' + esc(u.qa) + '</b>' + statusPill(u.status) +
+        '<span>' + esc(fmtDay(u.shiftDate)) + ' · ' + esc(u.shift) + '</span>' +
+        (own ? '<span class="acts"><button class="linkish" type="button" data-edit="' + esc(u.id) + '">Edit</button>' +
+          '<button class="linkish danger" type="button" data-del="' + esc(u.id) + '">Delete</button></span>' : '') + '</div>' +
+        (u.notes ? '<p>' + esc(u.notes) + '</p>' : '') + (links ? '<div class="links">' + links + '</div>' : '') + '</li>';
+    }).join('') : '';
+
+    var facts = [
+      ['Priority', a.priority ? '<span class="prio ' + a.prio + '">' + esc(a.priority) + '</span>' : '—'],
+      ['Due', a.dueDate ? esc(fmtDay(a.dueDate, true)) + (!a.closed && a.dueIn <= 2
+        ? ' <span class="due ' + (a.dueIn < 0 ? 'late' : 'soon') + '">(' + (a.dueIn < 0 ? Math.abs(a.dueIn) + 'd overdue' : a.dueIn === 0 ? 'today' : 'in ' + a.dueIn + 'd') + ')</span>' : '')
+        : esc(a.dueDateRaw || '—')],
+      ['Ticket', esc(a.ticketNumber || '—')],
+      ['Posted', a.postedAt ? esc(new Date(a.postedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })) : '—'],
+      ['Added from', a.source === 'paste' ? 'Paste AXO' : 'Slack sync']
+    ];
+    if (a.closed && a.closedAt) facts.push(['Closed', esc(new Date(a.closedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }))]);
+
+    el.innerHTML =
+      '<div class="d-head"><div class="d-top"><span class="c-num">AXO ' + esc(a.axoNumber) + '</span>' + statusPill(a.status) +
+      (a.closed ? '<span class="tag closed">Closed</span>' : '') +
+      '<span class="acts">' + (link ? '<a class="btn btn-sm" href="' + esc(link) + '" target="_blank" rel="noopener">Axosoft ↗</a>' : '') +
+      '<button class="btn btn-sm" type="button" id="d-toggle">' + (a.closed ? 'Reopen' : 'Mark closed') + '</button>' +
+      '<button class="btn btn-sm btn-quiet" type="button" id="d-close" aria-label="Close panel">✕</button></span></div>' +
+      '<h2>' + esc(a.title || '(no title)') + '</h2><div class="d-people">' + people.join('') + '</div></div>' +
+      '<div class="d-body">' +
+      '<section id="c-slot">' + (m ? '' : '<div class="tip">Pick your name at the top right to add an update.</div>') + '</section>' +
+      '<section><h3>History · ' + a.updates.length + ' update' + (a.updates.length === 1 ? '' : 's') + '</h3>' +
+      (tl ? '<ol class="timeline">' + tl + '</ol>' : '<div class="tl-empty">No QA updates yet.</div>') + '</section>' +
+      '<section><h3>Details</h3><dl class="facts">' + facts.map(function (f) { return '<dt>' + f[0] + '</dt><dd>' + f[1] + '</dd>'; }).join('') + '</dl></section>' +
+      (a.additionalInfo ? '<section><h3>Additional info</h3><div class="info-box">' + esc(a.additionalInfo) + '</div></section>' : '') +
+      '</div>';
+
+    if (m) {
+      if (saved) { $('c-slot').appendChild(saved); }
+      else {
+        var u = S.editId ? a.updates.filter(function (x) { return x.id === S.editId; })[0] : null;
+        if (S.editId && !u) S.editId = '';
+        $('c-slot').innerHTML = composerHtml(a, u);
+        (u ? u.files : []).forEach(function (f) { addLinkRow(f.name, f.url); });
+        if (!$('c-links').children.length) addLinkRow();
+        S.composerFor = a.axoNumber; S.dirty = false;
+        wireComposer();
+      }
+    }
+  }
+
+  function wireComposer() {
+    var f = $('composer');
+    f.addEventListener('input', function () { S.dirty = true; });
+    f.addEventListener('change', function () { S.dirty = true; });
+    f.addEventListener('submit', saveUpdate);
+    $('c-add-link').onclick = function () { addLinkRow(); };
+    if ($('c-cancel')) $('c-cancel').onclick = function () { S.editId = ''; S.composerFor = ''; renderDetail(); };
+  }
+
+  function saveUpdate(ev) {
+    ev.preventDefault();
+    if (!requireMe()) return;
+    var err = $('c-err'), btn = $('c-save');
+    var st = document.querySelector('input[name="c-status"]:checked'), sh = document.querySelector('input[name="c-shift"]:checked');
+    var payload = {
+      axoNumber: S.open, qa: me(), shiftDate: $('c-date').value, shift: sh ? sh.value : '', status: st ? st.value : '',
+      notes: $('c-notes').value,
+      files: [].map.call($('c-links').children, function (row) {
+        return { name: row.querySelector('.lk-name').value.trim(), url: row.querySelector('.lk-url').value.trim() };
+      }).filter(function (x) { return x.url; })
+    };
+    if (payload.files.some(function (x) { return !safeUrl(x.url); })) { err.textContent = 'Links must start with https://'; err.hidden = false; return; }
+    btn.disabled = true; err.hidden = true;
+    var editing = S.editId;
+    (editing ? call('apiEditUpdate', editing, payload) : call('apiAddUpdate', payload)).then(function (d) {
+      S.data = d; S.editId = ''; S.composerFor = ''; S.dirty = false;
+      render();
+      toast(editing ? 'Update saved.' : 'Update added to AXO ' + payload.axoNumber + '.');
+    }, function (e) { err.textContent = e.message; err.hidden = false; btn.disabled = false; });
+  }
+
+  function requireMe() {
+    if (me()) return true;
+    var w = $('me-wrap'); w.classList.remove('nudge'); void w.offsetWidth; w.classList.add('nudge');
+    $('me-select').focus();
+    toast('Pick your name at the top right first.', true);
+    return false;
+  }
+
+  /* ---------- pick + paste dialogs ---------- */
+  function openPick() {
+    $('axo-options').innerHTML = all().filter(function (a) { return !a.closed; })
+      .sort(function (x, y) { return Number(y.axoNumber) - Number(x.axoNumber); })
+      .map(function (a) { return '<option value="' + esc(a.axoNumber + ' - ' + (a.title || '')) + '"></option>'; }).join('');
+    $('pick-axo').value = ''; $('pick-err').hidden = true;
+    $('pick-dlg').showModal(); $('pick-axo').focus();
+  }
+  function openPaste() {
+    $('paste-text').value = ''; $('paste-preview').hidden = true; $('paste-err').hidden = true; $('paste-save').disabled = true;
+    $('paste-dlg').showModal(); $('paste-text').focus();
+  }
+  function checkPaste() {
+    var text = $('paste-text').value;
+    $('paste-err').hidden = true;
+    if (!text.trim()) return;
+    call('apiParseAxo', text).then(function (a) {
+      if (!a) {
+        $('paste-err').textContent = 'No AXO number found. Paste the whole Slack post, starting from "Axo Number".';
+        $('paste-err').hidden = false; $('paste-preview').hidden = true; $('paste-save').disabled = true; return;
+      }
+      var exists = S.byNum[a.axoNumber];
+      var rows = [['AXO', a.axoNumber], ['Title', a.title], ['Priority', a.priority], ['Link', a.link],
+        ['Due date', a.dueDate ? fmtDay(a.dueDate, true) : a.dueDateRaw], ['Client', a.client], ['Ticket', a.ticketNumber],
+        ['Raised by', a.raisedBy], ['Dev', a.devAssignees.join(', ')]];
+      $('paste-preview').innerHTML = (exists ? '<div class="tip" style="margin:0 0 10px"><b>Already in the tracker.</b> Saving fills in any blanks and won\'t create a duplicate.</div>' : '') +
+        '<dl class="facts">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1] || '—') + '</dd>'; }).join('') + '</dl>';
+      $('paste-preview').hidden = false;
+      $('paste-save').disabled = false;
+      $('paste-save').textContent = exists ? 'Update AXO' : 'Add AXO';
+    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; });
+  }
+  function savePaste(ev) {
+    ev.preventDefault();
+    $('paste-save').disabled = true;
+    call('apiPasteAxo', $('paste-text').value).then(function (r) {
+      $('paste-dlg').close();
+      toast(r.added ? 'AXO ' + r.axo.axoNumber + ' added.' : r.updated ? 'AXO ' + r.axo.axoNumber + ' updated.' : 'AXO ' + r.axo.axoNumber + ' was already up to date.');
+      return refresh().then(function () { openDetail(r.axo.axoNumber); });
+    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; $('paste-save').disabled = false; });
+  }
+
+  /* ---------- render + data ---------- */
+  function render() {
+    derive();
+    renderHeader();
+    renderRail();
+    renderToolbar();
+    renderBoard();
+    renderDetail();
+  }
+  function refresh() {
+    return call('apiBootstrap').then(function (d) { S.data = d; render(); }, function (e) { toast(e.message, true); });
+  }
+  function savePrefs() {
+    store('npdqa.view', JSON.stringify({ queue: S.queue, qa: S.qa, prio: $('f-prio').value, client: $('f-client').value, sort: $('f-sort').value }));
+  }
+  function loadPrefs() {
+    var p = null;
+    try { p = JSON.parse(store('npdqa.view') || 'null'); } catch (e) {}
+    if (!p) { S.queue = me() ? 'needs' : 'active'; return; }
+    S.queue = p.queue || 'active'; S.qa = p.qa || '';
+    if (p.prio) $('f-prio').setAttribute('data-want', p.prio);
+    if (p.client) $('f-client').setAttribute('data-want', p.client);
+    if (p.sort) $('f-sort').value = p.sort;
+  }
+
+  /* ---------- events ---------- */
+  function wire() {
+    $('me-select').onchange = function () { store('npdqa.me', this.value); S.composerFor = ''; render(); };
+    $('help-btn').onclick = function () { $('help-dlg').showModal(); };
+    $('help-close').onclick = function () { $('help-dlg').close(); };
+    $('paste-btn').onclick = openPaste;
+    $('add-btn').onclick = function () { if (requireMe()) openPick(); };
+    $('sync').onclick = function () {
+      if (!S.data || !S.data.slack.configured) { toast('Slack sync is not set up. Use Paste AXO to add AXOs.'); return; }
+      $('sync').className = 'sync busy'; $('sync-text').textContent = 'Syncing…';
+      call('apiSyncNow').then(function (d) { S.data = d; render(); toast('Slack sync done.'); }, function (e) { toast(e.message, true); render(); });
+    };
+
+    function pickQueue(e) {
+      var b = e.target.closest('[data-queue]'); if (!b) return;
+      S.queue = b.getAttribute('data-queue'); savePrefs(); renderRail(); renderBoard();
+    }
+    $('queues').onclick = pickQueue; $('stats').onclick = pickQueue;
+    $('team').onclick = function (e) {
+      var b = e.target.closest('[data-qa]'); if (!b) return;
+      var q = b.getAttribute('data-qa'); S.qa = S.qa === q ? '' : q; savePrefs(); renderRail(); renderBoard();
+    };
+    $('board-title').onclick = function (e) { if (e.target.id === 'clear-qa') { S.qa = ''; savePrefs(); renderRail(); renderBoard(); } };
+    $('f-q').addEventListener('input', renderBoard);
+    ['f-prio', 'f-client', 'f-sort'].forEach(function (id) { $(id).addEventListener('change', function () { savePrefs(); renderBoard(); }); });
+
+    $('cards').onclick = function (e) {
+      var u = e.target.closest('[data-update]'); if (u) { openDetail(u.getAttribute('data-update'), true); return; }
+      var c = e.target.closest('[data-open]'); if (c) openDetail(c.getAttribute('data-open'));
+    };
+    $('cards').onkeydown = function (e) {
+      if (e.key !== 'Enter' || e.target.tagName === 'BUTTON') return;
+      var c = e.target.closest('[data-open]'); if (c) openDetail(c.getAttribute('data-open'));
+    };
+
+    $('detail').onclick = function (e) {
+      var a = S.byNum[S.open]; if (!a) return;
+      if (e.target.closest('#d-close')) { closeDetail(); return; }
+      if (e.target.closest('#d-toggle')) {
+        if (!requireMe()) return;
+        var b = e.target.closest('#d-toggle'); b.disabled = true;
+        call('apiSetAxoState', a.axoNumber, a.closed ? 'Active' : 'Closed').then(function (d) {
+          S.data = d; render(); toast('AXO ' + a.axoNumber + (a.closed ? ' reopened.' : ' closed.'));
+        }, function (er) { toast(er.message, true); b.disabled = false; });
+        return;
+      }
+      var ed = e.target.closest('[data-edit]');
+      if (ed) { S.editId = ed.getAttribute('data-edit'); S.composerFor = ''; renderDetail(); $('c-notes').focus(); return; }
+      var del = e.target.closest('[data-del]');
+      if (del) {
+        if (del.getAttribute('data-armed') !== '1') { del.setAttribute('data-armed', '1'); del.textContent = 'Click again to delete'; return; }
+        call('apiDeleteUpdate', del.getAttribute('data-del')).then(function (d) { S.data = d; render(); toast('Update deleted.'); }, function (er) { toast(er.message, true); });
+      }
+    };
+    $('scrim').onclick = closeDetail;
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && S.open && !document.querySelector('dialog[open]')) closeDetail();
+    });
+    window.matchMedia('(max-width:1240px)').addEventListener('change', function () { if (S.data) renderDetail(); });
+
+    $('pick-form').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var m = $('pick-axo').value.match(/\d{3,}/);
+      if (!m || !S.byNum[m[0]]) { $('pick-err').textContent = 'Pick an AXO from the list.'; $('pick-err').hidden = false; return; }
+      $('pick-dlg').close(); openDetail(m[0], true);
+    });
+    $('pick-cancel').onclick = function () { $('pick-dlg').close(); };
+    $('paste-form').addEventListener('submit', savePaste);
+    $('paste-cancel').onclick = function () { $('paste-dlg').close(); };
+    $('paste-check').onclick = checkPaste;
+    $('paste-text').addEventListener('paste', function () { setTimeout(checkPaste, 0); });
+
+    // New AXOs arrive from Slack: refresh every 2 minutes while the tab is visible.
+    setInterval(function () {
+      if (document.visibilityState === 'visible' && !document.querySelector('dialog[open]')) refresh();
+    }, 120000);
+  }
+
+  wire();
+  loadPrefs();
+  refresh();
+})();
+</script>

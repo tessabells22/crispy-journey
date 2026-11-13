@@ -1,0 +1,9 @@
+{
+  "name": "npd-qa-axo-tracker",
+  "private": true,
+  "description": "NPD QA AXO Tracker (Google Apps Script web app, fed from Slack)",
+  "scripts": {
+    "test": "node tests/parser.test.js && node tests/backend.test.js",
+    "preview": "node tools/preview-server.js"
+  }
+}
