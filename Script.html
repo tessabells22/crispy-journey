@@ -123,7 +123,20 @@
     if (edited && u.updatedAt.slice(0, 16) !== u.createdAt.slice(0, 16)) t += ' · edited ' + edited;
     return '<time class="ev-time" datetime="' + esc(u.createdAt) + '">' + esc(t) + '</time>';
   }
+  // Same rule as closesAxo() in Parser.gs.
+  function closesAxo(title, status) {
+    if (status === 'Passed - Develop/Deployment') return true;
+    return status === 'Passed - Initial' && /\[\s*back[\s-]?end\s*\]/i.test(String(title || ''));
+  }
+  function slackLink(a) {
+    var base = S.data.slack && S.data.slack.threadBase, ts = String(a.slackTs || '');
+    return base && /^\d+\.\d+$/.test(ts) ? base + ts.replace('.', '') : '';
+  }
   function shortPrio(p) { var w = String(p || '').trim().split(/[\s(]/)[0]; return w || String(p || ''); }
+  // Sort by status: most in need of attention first, passed last.
+  var STATUS_ORDER = ['Urgent/High Prio', 'Blocked', 'Failed - Develop/Deployment', 'Failed - Initial', '', 'Not Tested',
+    'In Progress', 'Needs Monitoring', 'Passed - Initial', 'Passed - Develop/Deployment'];
+  function statusRank(a) { var i = STATUS_ORDER.indexOf(a.status || ''); return i < 0 ? 5 : i; }
   var PRIO_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3, '': 4 };
 
   /* ---------- derive ---------- */
@@ -244,6 +257,7 @@
       if (sort === 'due') r = (x.dueIn === null ? 1e9 : x.dueIn) - (y.dueIn === null ? 1e9 : y.dueIn) || PRIO_RANK[x.prio] - PRIO_RANK[y.prio];
       else if (sort === 'prio') r = PRIO_RANK[x.prio] - PRIO_RANK[y.prio] || (x.dueIn === null ? 1e9 : x.dueIn) - (y.dueIn === null ? 1e9 : y.dueIn);
       else if (sort === 'updated') r = (y.lastKey || '').localeCompare(x.lastKey || '');
+      else if (sort === 'status') r = statusRank(x) - statusRank(y) || (x.dueIn === null ? 1e9 : x.dueIn) - (y.dueIn === null ? 1e9 : y.dueIn);
       return r || Number(y.axoNumber) - Number(x.axoNumber);
     });
     return list;
@@ -468,6 +482,7 @@
     return '<form class="composer' + (u ? ' editing' : '') + '" id="composer">' +
       '<div class="lbl">' + (u ? 'Editing your update' : 'Your update') + '</div>' +
       '<div class="chips" role="radiogroup" aria-label="Status">' + chips + '</div>' +
+      '<div class="c-hint" id="c-hint" data-title="' + esc(a.title || '') + '" hidden>Saving this closes the AXO.</div>' +
       '<div class="row2"><div class="fld"><span class="lbl">Shift date</span><input type="date" id="c-date" value="' + esc(date) + '"></div>' +
       '<div class="fld"><span class="lbl">Shift</span><div class="seg" role="radiogroup" aria-label="Shift">' + seg + '</div></div></div>' +
       '<div class="fld"><span class="lbl">Notes</span><textarea id="c-notes" placeholder="What you tested, what you found, what the next shift should know">' + esc(u ? u.notes : '') + '</textarea></div>' +
@@ -508,7 +523,7 @@
     var keepComposer = S.composerFor === a.axoNumber && $('composer');
     var saved = keepComposer ? $('composer') : null;
 
-    var link = safeUrl(a.link);
+    var link = safeUrl(a.link), slack = slackLink(a);
     var people = [];
     people.push('<span>Dev <b>' + (a.devAssignees.length ? esc(a.devAssignees.join(', ')) : 'not assigned') + '</b></span>');
     if (a.raisedBy) people.push('<span>Raised by <b>' + esc(a.raisedBy) + '</b></span>');
@@ -544,6 +559,7 @@
       '<div class="d-head"><div class="d-top"><span class="c-num">AXO ' + esc(a.axoNumber) + '</span>' + statusPill(a.status) +
       (a.closed ? '<span class="tag closed">Closed</span>' : '') +
       '<span class="acts">' + (link ? '<a class="btn btn-sm" href="' + esc(link) + '" target="_blank" rel="noopener">Axosoft ↗</a>' : '') +
+      (slack ? '<a class="btn btn-sm" href="' + esc(slack) + '" target="_blank" rel="noopener" title="Open the AXO post and its thread in Slack">Slack thread ↗</a>' : '') +
       '<button class="btn btn-sm" type="button" id="d-toggle">' + (a.closed ? 'Reopen' : 'Mark closed') + '</button>' +
       '<button class="btn btn-sm btn-quiet" type="button" id="d-close" aria-label="Close panel">✕</button></span></div>' +
       '<h2>' + esc(a.title || '(no title)') + '</h2><div class="d-people">' + people.join('') + '</div></div>' +
@@ -574,6 +590,11 @@
     f.addEventListener('input', function () { S.dirty = true; });
     f.addEventListener('change', function () { S.dirty = true; });
     f.addEventListener('submit', saveUpdate);
+    function hint() {
+      var st = document.querySelector('input[name="c-status"]:checked'), h = $('c-hint');
+      h.hidden = !(st && closesAxo(h.getAttribute('data-title'), st.value));
+    }
+    f.addEventListener('change', hint); hint();
     $('c-add-link').onclick = function () { addLinkRow(); };
     if ($('c-cancel')) $('c-cancel').onclick = function () { S.editId = ''; S.composerFor = ''; renderDetail(); };
   }

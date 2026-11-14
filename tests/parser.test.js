@@ -121,4 +121,12 @@ t('legacyUpdatesFrom maps endorsement rows to updates', () => {
   assert.strictEqual(u[1].updatedAt, '2026-10-08T05:00:00Z');
 });
 
+t('closesAxo: Backend closes at Passed - Initial, others at Develop/Deployment', () => {
+  assert.strictEqual(P.closesAxo('[Backend] - PRLA_V2: New EOD Close API', 'Passed - Initial'), true);
+  assert.strictEqual(P.closesAxo('[7139] [Back-end] - thing', 'Passed - Initial'), true);
+  assert.strictEqual(P.closesAxo('[Frontend] - Bug AXO: x', 'Passed - Initial'), false);
+  assert.strictEqual(P.closesAxo('[Frontend] - Bug AXO: x', 'Passed - Develop/Deployment'), true);
+  assert.strictEqual(P.closesAxo('[Backend] x', 'In Progress'), false);
+});
+
 console.log(n + ' tests passed');

@@ -140,4 +140,29 @@ t('importEndorsementHistory copies old AXO lines, re-runs safely, fixes open/clo
   assert.strictEqual(plain(g.ctx.importEndorsementHistory()).updatesAdded, 0);
 });
 
+t('[Backend] AXOs close at Passed - Initial; closePassedAxos sweeps old ones', () => {
+  const g = loadGas();
+  g.ctx.apiPasteAxo('Axo Number: 3001 - [Backend] - API thing');
+  g.ctx.apiPasteAxo('Axo Number: 3002 - [Frontend] - UI thing');
+  g.ctx.apiPasteAxo('Axo Number: 3003 - [Backend] - Older thing');
+  const up = (num, status) => ({ axoNumber: num, qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status, notes: '', files: [] });
+  // simulate an old Passed - Initial on 3003 written before the rule existed
+  const sh = g.ss.getSheetByName('Updates') || g.ss.insertSheet('Updates');
+  g.ctx.apiAddUpdate(up('3003', 'In Progress'));
+  const rows = sh.dump(); rows[rows.length - 1][5] = 'Passed - Initial'; sh.getRange(rows.length, 6).setValue('Passed - Initial');
+  let b = plain(g.ctx.apiAddUpdate(up('3001', 'Passed - Initial')));
+  b = plain(g.ctx.apiAddUpdate(up('3002', 'Passed - Initial')));
+  let st = Object.fromEntries(b.axos.map(a => [a.axoNumber, a.state]));
+  assert.deepStrictEqual(st, { '3001': 'Closed', '3002': 'Active', '3003': 'Active' });
+  assert.deepStrictEqual(plain(g.ctx.closePassedAxos()), ['3003']);
+  st = Object.fromEntries(plain(g.ctx.apiBootstrap()).axos.map(a => [a.axoNumber, a.state]));
+  assert.strictEqual(st['3003'], 'Closed');
+});
+
+t('bootstrap gives a Slack thread base from auth.test', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1' } });
+  g.setFetch((url) => /auth.test/.test(url) ? { body: { ok: true, url: 'https://acme.slack.com/' } } : slackFake([])(url));
+  assert.strictEqual(g.ctx.apiBootstrap().slack.threadBase, 'https://acme.slack.com/archives/G1/p');
+});
+
 console.log(n + ' tests passed');

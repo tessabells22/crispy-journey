@@ -20,7 +20,7 @@ the update form and history.
 
 Every update is kept, so an AXO shows its full history and everyone who worked on it.
 Several QAs can update the same AXO. An update with **Passed - Develop/Deployment** closes
-the AXO; **Reopen** in the AXO panel brings it back, and **Mark closed** closes one by hand.
+the AXO (an AXO titled **[Backend]** closes at **Passed - Initial**); **Reopen** in the AXO panel brings it back, and **Mark closed** closes one by hand.
 
 Statuses: Not Tested, In Progress, Passed - Initial, Passed - Develop/Deployment,
 Failed - Initial, Failed - Develop/Deployment, Needs Monitoring, Urgent/High Prio, Blocked.

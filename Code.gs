@@ -22,7 +22,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-14.1';
+var BUILD = '2026-11-14.2';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
@@ -40,8 +40,8 @@ var QA_HEADERS = ['Name', 'Active'];
 var SHIFTS = ['Day', 'Mid', 'Night'];
 var STATUSES = ['Not Tested', 'In Progress', 'Passed - Initial', 'Passed - Develop/Deployment',
   'Failed - Initial', 'Failed - Develop/Deployment', 'Needs Monitoring', 'Urgent/High Prio', 'Blocked'];
-/* An update with one of these statuses closes the AXO (Reopen undoes it). */
-var AUTO_CLOSE_STATUSES = ['Passed - Develop/Deployment'];
+/* Which status closes an AXO lives in closesAxo() in Parser.gs:
+   Passed - Develop/Deployment for all, Passed - Initial for [Backend]. Reopen undoes it. */
 
 /* ============================================================
    WEB APP
@@ -316,6 +316,16 @@ function syncSince_(oldestTs, opts) {
   return result;
 }
 
+/* Workspace URL (e.g. https://acme.slack.com/), cached from auth.test so the
+   web app can link each AXO to its Slack post. '' when Slack isn't set up. */
+function slackTeamUrl_() {
+  var url = prop_('SLACK_TEAM_URL');
+  if (url || !prop_('SLACK_USER_TOKEN')) return url || '';
+  try { url = slackApi_('auth.test', {}).url || ''; } catch (e) { return ''; }
+  if (url) setProp_('SLACK_TEAM_URL', url);
+  return url;
+}
+
 /* Time-trigger entry point. Re-scans a short window so dev-assignee thread
    replies that arrive after the post are still picked up. */
 function syncSlack() {
@@ -376,6 +386,21 @@ function closeImportedAxos(beforeIso, all, createdAfterIso) {
 }
 function closeAllImportedAxos() { return closeImportedAxos('', true); }
 
+/* One-time sweep for the [Backend] rule: closes every active AXO whose latest
+   update already meets closesAxo(). Safe to re-run. */
+function closePassedAxos() {
+  var byAxo = {};
+  readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_).forEach(function (u) { (byAxo[u.axoNumber] = byAxo[u.axoNumber] || []).push(u); });
+  var closed = [];
+  readRows_(AXO_SHEET, AXO_HEADERS).forEach(function (r) {
+    if ((r.State || 'Active') !== 'Active') return;
+    var latest = latestUpdate(byAxo[r.AxoNumber]);
+    if (latest && closesAxo(r.Title, latest.status)) { setAxoState_(r.AxoNumber, 'Closed'); closed.push(r.AxoNumber); }
+  });
+  console.log('Closed ' + closed.length + ' AXOs: ' + closed.join(', '));
+  return closed;
+}
+
 /* ---------- one-time import from the old Endorsement Tracker ----------
    Reads the old tracker's "Endorsements" sheet (read only: nothing is ever
    written there) and adds each AXO line as an update on the matching AXO
@@ -424,7 +449,7 @@ function importEndorsementHistory() {
     var closed = [], reopened = [];
     Object.keys(touched).forEach(function (num) {
       var latest = latestUpdate(byAxo[num]);
-      var want = latest && AUTO_CLOSE_STATUSES.indexOf(latest.status) >= 0 ? 'Closed' : 'Active';
+      var want = latest && closesAxo(known[num].Title, latest.status) ? 'Closed' : 'Active';
       var was = known[num].State || 'Active';
       if (was === want) return;
       setAxoState_(num, want);
@@ -494,7 +519,11 @@ function apiBootstrap() {
       .filter(function (r) { return r.Name && String(r.Active).toLowerCase() !== 'false'; })
       .map(function (r) { return r.Name; }),
     statuses: STATUSES, shifts: SHIFTS,
-    slack: { configured: !!(prop_('SLACK_USER_TOKEN') && prop_('SLACK_CHANNEL_ID')), lastSync: sync, lastError: err }
+    slack: {
+      configured: !!(prop_('SLACK_USER_TOKEN') && prop_('SLACK_CHANNEL_ID')), lastSync: sync, lastError: err,
+      // Thread link = threadBase + Slack ts without the dot, e.g. …/archives/G123/p1763000000000100
+      threadBase: slackTeamUrl_() && prop_('SLACK_CHANNEL_ID') ? slackTeamUrl_().replace(/\/?$/, '/') + 'archives/' + prop_('SLACK_CHANNEL_ID') + '/p' : ''
+    }
   };
 }
 
@@ -573,15 +602,15 @@ function apiAddUpdate(update) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var exists = readRows_(AXO_SHEET, AXO_HEADERS).some(function (r) { return r.AxoNumber === u.axoNumber; });
-    if (!exists) throw new Error('AXO ' + u.axoNumber + ' is not in the tracker.');
+    var axo = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) { return r.AxoNumber === u.axoNumber; })[0];
+    if (!axo) throw new Error('AXO ' + u.axoNumber + ' is not in the tracker.');
     var sh = sheet_(UPDATE_SHEET, UPDATE_HEADERS);
     var now = nowIso_();
     var id = Utilities.getUuid();
     sh.getRange(sh.getLastRow() + 1, 1, 1, UPDATE_HEADERS.length)
       .setNumberFormat('@')
       .setValues([rowValues_(updateToRow_(id, u, now, now), UPDATE_HEADERS)]);
-    if (AUTO_CLOSE_STATUSES.indexOf(u.status) >= 0) setAxoState_(u.axoNumber, 'Closed');
+    if (closesAxo(axo.Title, u.status)) setAxoState_(u.axoNumber, 'Closed');
   } finally {
     lock.releaseLock();
   }
@@ -597,7 +626,8 @@ function apiEditUpdate(id, update) {
     if (!row) throw new Error('That update no longer exists.');
     sheet_(UPDATE_SHEET, UPDATE_HEADERS).getRange(row._row, 1, 1, UPDATE_HEADERS.length)
       .setValues([rowValues_(updateToRow_(row.Id, u, row.CreatedAt, nowIso_()), UPDATE_HEADERS)]);
-    if (AUTO_CLOSE_STATUSES.indexOf(u.status) >= 0) setAxoState_(u.axoNumber, 'Closed');
+    var axoRow = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) { return r.AxoNumber === u.axoNumber; })[0];
+    if (axoRow && closesAxo(axoRow.Title, u.status)) setAxoState_(u.axoNumber, 'Closed');
   } finally {
     lock.releaseLock();
   }

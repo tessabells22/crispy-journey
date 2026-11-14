@@ -285,12 +285,19 @@ function latestUpdate(updates) {
   })[0] || null;
 }
 
+/* Closing rule: any AXO closes at "Passed - Develop/Deployment"; an AXO whose
+   title is tagged [Backend] already closes at "Passed - Initial". */
+function closesAxo(title, status) {
+  if (status === 'Passed - Develop/Deployment') return true;
+  return status === 'Passed - Initial' && /\[\s*back[\s-]?end\s*\]/i.test(String(title || ''));
+}
+
 /* Node export for tests; ignored by Apps Script. */
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     cleanSlackText: cleanSlackText, blocksToText: blocksToText, splitAxoLine: splitAxoLine,
     normalizeDueDate: normalizeDueDate, parseAssignments: parseAssignments,
     parseAxoPost: parseAxoPost, mergeAxo: mergeAxo,
-    legacyUpdatesFrom: legacyUpdatesFrom, latestUpdate: latestUpdate
+    legacyUpdatesFrom: legacyUpdatesFrom, latestUpdate: latestUpdate, closesAxo: closesAxo
   };
 }
