@@ -50,7 +50,7 @@
       </div>
       <div>
         <h2>Insights</h2>
-        <div class="queues"><button class="queue" type="button" id="reports-btn" data-queue="reports" aria-current="false" style="--q:var(--brand)"><span class="ic"></span>Reports and workload</button></div>
+        <div class="queues"><button class="queue" type="button" id="handover-btn" data-queue="handover" aria-current="false" style="--q:var(--orange)"><span class="ic"></span>Shift handover</button><button class="queue" type="button" id="reports-btn" data-queue="reports" aria-current="false" style="--q:var(--brand)"><span class="ic"></span>Reports and workload</button></div>
       </div>
       <div class="team-wrap">
         <h2>Team</h2>
@@ -77,6 +77,14 @@
       </div>
       <div class="cards" id="cards"><div class="loading">Loading…</div></div>
       <div class="foot"><span id="count"></span><span id="build"></span></div>
+    </main>
+
+    <main class="board reports" id="handover" hidden>
+      <div class="board-head">
+        <h2>Shift handover</h2>
+        <select class="tb-sel" id="h-shift" aria-label="Shift"></select>
+      </div>
+      <div id="h-body"></div>
     </main>
 
     <main class="board reports" id="reports" hidden>
@@ -143,6 +151,7 @@
         <li>Pick your name at the top right. It is remembered on this browser.</li>
         <li>Open the AXO you worked on. <b>Needs a QA</b> lists AXOs nobody has touched yet, and <b>My AXOs</b> lists the ones you have updated.</li>
         <li>In the panel, pick a status, check the shift date and shift, write your notes, add any test file links, and save. Every update is kept as history.</li>
+        <li><b>Shift handover</b> (left rail) shows what the last shift updated, open items first. <b>Going stale</b> lists active AXOs with no update in the last 2 shifts.</li>
         <li><b>Passed - Develop/Deployment</b> closes the AXO. A <b>[Backend]</b> AXO already closes at <b>Passed - Initial</b>. Use <b>Reopen</b> in the panel if it needs more work.</li>
         <li>If an AXO is missing, copy its Slack post and use <b>Paste AXO</b>.</li>
       </ol>

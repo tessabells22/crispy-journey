@@ -26,11 +26,12 @@
     { key: 'mine', label: 'My AXOs', color: 'var(--brand)', test: function (a) { return !a.closed && a.qas.indexOf(me()) >= 0; } },
     { key: 'due', label: 'Due in 2 days', color: 'var(--warn)', alert: true, test: function (a) { return !a.closed && a.dueIn !== null && a.dueIn <= 2; } },
     { key: 'attention', label: 'Blocked or failing', color: 'var(--bad)', alert: true, test: function (a) { return !a.closed && (a.status === 'Blocked' || a.status === 'Urgent/High Prio' || /^Failed/.test(a.status)); } },
+    { key: 'stale', label: 'Going stale', color: 'var(--faint)', test: function (a) { return a.stale; } },
     { key: 'monitor', label: 'Needs monitoring', color: 'var(--s-mon)', test: function (a) { return !a.closed && a.status === 'Needs Monitoring'; } },
     { key: 'active', label: 'All active', color: 'var(--sky)', test: function (a) { return !a.closed; } },
     { key: 'closed', label: 'Closed', color: 'var(--ok)', test: function (a) { return a.closed; } }
   ];
-  function queueDef(k) { return QUEUES.filter(function (q) { return q.key === k; })[0] || QUEUES[5]; }
+  function queueDef(k) { return QUEUES.filter(function (q) { return q.key === k; })[0] || queueDef('active'); }
 
   /* ---------- helpers ---------- */
   function $(id) { return document.getElementById(id); }
@@ -86,6 +87,13 @@
     if (m.hour >= 13 && m.hour <= 21) return { date: m.date, shift: 'Mid' };
     return { date: m.hour < 5 ? addDays(m.date, -1) : m.date, shift: 'Night' };
   }
+  function prevShift(sd) {
+    if (sd.shift === 'Day') return { date: addDays(sd.date, -1), shift: 'Night' };
+    return { date: sd.date, shift: sd.shift === 'Mid' ? 'Day' : 'Mid' };
+  }
+  // Shifts counted from a fixed day, so "how many shifts ago" is a subtraction.
+  function shiftIndex(date, shift) { return Math.round(new Date(date + 'T00:00:00Z') / 864e5) * 3 + shiftRank(shift); }
+  var STALE_SHIFTS = 2;
   function shiftRank(s) { return s === 'Day' ? 0 : s === 'Mid' ? 1 : s === 'Night' ? 2 : 3; }
   function fmtDay(iso, withYear) {
     if (!/^\d{4}-\d{2}-\d{2}/.test(iso || '')) return iso || '';
@@ -128,6 +136,7 @@
     if (status === 'Passed - Develop/Deployment') return true;
     return status === 'Passed - Initial' && /\[\s*back[\s-]?end\s*\]/i.test(String(title || ''));
   }
+  var SLACK_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/><path d="M8.5 12h7M12 8.5v7"/></svg>';
   function slackLink(a) {
     var base = S.data.slack && S.data.slack.threadBase, ts = String(a.slackTs || '');
     return base && /^\d+\.\d+$/.test(ts) ? base + ts.replace('.', '') : '';
@@ -158,6 +167,9 @@
       a.prio = prioClass(a.priority);
       a.closed = a.state === 'Closed';
       a.dueIn = a.dueDate ? Math.round((new Date(a.dueDate + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 864e5) : null;
+      var cs = currentShift();
+      a.shiftsSince = a.latest && /^\d{4}-\d{2}-\d{2}$/.test(a.latest.shiftDate || '') ? shiftIndex(cs.date, cs.shift) - shiftIndex(a.latest.shiftDate, a.latest.shift) : null;
+      a.stale = !a.closed && a.shiftsSince !== null && a.shiftsSince > STALE_SHIFTS;
       a.lastKey = a.latest ? a.latest.shiftDate + shiftRank(a.latest.shift) + a.latest.createdAt : '';
     });
     S.byNum = byNum;
@@ -283,11 +295,14 @@
       ups.map(function (u) { return '<i style="--c:' + sColor(u.status) + '" title="' + esc(u.status + ' · ' + u.qa + ' · ' + fmtDay(u.shiftDate) + ' ' + u.shift) + '"></i>'; }).join('') + '</span>';
   }
 
+  function isView(q) { return q === 'reports' || q === 'handover'; }
   function renderBoard() {
-    var rep = S.queue === 'reports';
-    $('board').hidden = rep; $('reports').hidden = !rep;
+    var rep = S.queue === 'reports', ho = S.queue === 'handover';
+    $('board').hidden = rep || ho; $('reports').hidden = !rep; $('handover').hidden = !ho;
     $('reports-btn').setAttribute('aria-current', String(rep));
+    $('handover-btn').setAttribute('aria-current', String(ho));
     if (rep) { renderReports(); return; }
+    if (ho) { renderHandover(); return; }
     var qd = queueDef(S.queue), list = filtered();
     $('board-title').innerHTML = esc(qd.label) + (S.qa ? ' <small>worked by ' + esc(S.qa) + ' · <button class="linkish" type="button" id="clear-qa">clear</button></small>' : '');
     if (!list.length) {
@@ -303,6 +318,8 @@
         if (a.ticketNumber) meta.push('<span><span class="k">Ticket</span> ' + esc(a.ticketNumber) + '</span>');
         meta.push('<span><span class="k">Dev</span> ' + (a.devAssignees.length ? esc(a.devAssignees.join(', ')) : 'not assigned') + '</span>');
         var dh = dueHtml(a); if (dh) meta.push(dh);
+        if (a.stale) meta.push('<span class="stale" title="Last update ' + esc(fmtDay(a.latest.shiftDate) + ' ' + a.latest.shift) + '">No update in ' + (a.shiftsSince - 1) + ' shifts</span>');
+        var sl = slackLink(a);
         var note = a.latest && a.latest.notes ? '<div class="c-note"><b>' + esc(a.latest.qa) + ':</b> ' + esc(a.latest.notes) + '</div>' : '';
         return '<article class="card' + (a.closed ? ' closed' : '') + '" data-open="' + esc(a.axoNumber) + '" aria-current="' + (S.open === a.axoNumber) + '" style="--sc:' + (a.status ? sColor(a.status) : 'var(--orange)') + '" tabindex="0">' +
           '<div class="c-top"><span class="c-num">' + esc(a.axoNumber) + '</span>' + (a.priority ? '<span class="prio ' + a.prio + '" title="' + esc(a.priority) + '">' + esc(shortPrio(a.priority)) + '</span>' : '') +
@@ -310,12 +327,56 @@
           '<div class="c-title">' + esc(a.title || '(no title)') + '</div>' +
           '<div class="c-meta">' + meta.join('') + '</div>' +
           '<div class="c-side">' + (a.qas.length ? '<span class="avs">' + a.qas.slice(0, 5).map(function (q) { return avatar(q); }).join('') + '</span>' : '') +
-          trail(a) + '<button class="upd-btn" type="button" data-update="' + esc(a.axoNumber) + '">Update</button></div>' + note + '</article>';
+          trail(a) + '<span class="c-acts">' + (sl ? '<a class="icon-btn" href="' + esc(sl) + '" target="_blank" rel="noopener" title="Open the Slack thread" aria-label="Open the Slack thread for AXO ' + esc(a.axoNumber) + '">' + SLACK_ICON + '</a>' : '') +
+          '<button class="upd-btn" type="button" data-update="' + esc(a.axoNumber) + '">Update</button></span></div>' + note + '</article>';
       }).join('');
     }
     var total = all().filter(qd.test).length;
     $('count').textContent = list.length === total ? list.length + ' AXO' + (list.length === 1 ? '' : 's') : list.length + ' of ' + total + ' AXOs';
     $('build').textContent = 'Build ' + S.data.build;
+  }
+
+  /* ---------- shift handover ---------- */
+  function renderHandover() {
+    var cs = currentShift(), prev = prevShift(cs), opts = [], sd = cs;
+    for (var i = 0; i < 9; i++) { opts.push(sd); sd = prevShift(sd); }
+    var want = S.hoPick || prev.date + '|' + prev.shift;
+    $('h-shift').innerHTML = opts.map(function (o, i) {
+      var v = o.date + '|' + o.shift;
+      return '<option value="' + v + '"' + (v === want ? ' selected' : '') + '>' + (i === 0 ? 'This shift: ' : i === 1 ? 'Last shift: ' : '') + o.shift + ' · ' + esc(fmtDay(o.date)) + '</option>';
+    }).join('');
+    var pick = want.split('|');
+    var rows = [];
+    all().forEach(function (a) {
+      var ups = a.updates.filter(function (u) { return u.shiftDate === pick[0] && u.shift === pick[1]; });
+      if (ups.length) rows.push({ a: a, ups: ups });
+    });
+    var att = function (s) { return s === 'Blocked' || s === 'Urgent/High Prio' || /^Failed/.test(s) || s === 'Needs Monitoring' || s === 'In Progress' || s === 'Not Tested'; };
+    rows.forEach(function (r) { r.last = r.ups[0]; r.rank = statusRank({ status: r.last.status }); });
+    rows.sort(function (x, y) { return x.rank - y.rank || Number(y.a.axoNumber) - Number(x.a.axoNumber); });
+    var qas = {}; rows.forEach(function (r) { r.ups.forEach(function (u) { qas[u.qa] = 1; }); });
+    var open = rows.filter(function (r) { return !r.a.closed && att(r.last.status); });
+    var done = rows.filter(function (r) { return !(!r.a.closed && att(r.last.status)); });
+    function item(r) {
+      var a = r.a, sl = slackLink(a), link = safeUrl(a.link);
+      var notes = r.ups.map(function (u) {
+        var files = (u.files || []).map(function (f) { var url = safeUrl(f.url); return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(f.name || 'link') + '</a>' : ''; }).join(' ');
+        return '<div class="h-up">' + avatar(u.qa, 'sm') + '<div><b>' + esc(u.qa) + '</b> ' + statusPill(u.status) +
+          (u.notes ? '<p>' + esc(u.notes) + '</p>' : '') + (files ? '<div class="links">' + files + '</div>' : '') + '</div></div>';
+      }).join('');
+      return '<article class="h-item" data-open="' + esc(a.axoNumber) + '" tabindex="0"><div class="h-top"><span class="c-num">' + esc(a.axoNumber) + '</span>' +
+        (a.priority ? '<span class="prio ' + a.prio + '">' + esc(shortPrio(a.priority)) + '</span>' : '') + statusPill(a.status) +
+        (a.closed ? '<span class="tag closed">Closed</span>' : '') + '<span class="h-links">' +
+        (link ? '<a href="' + esc(link) + '" target="_blank" rel="noopener">Axosoft ↗</a>' : '') + (sl ? '<a href="' + esc(sl) + '" target="_blank" rel="noopener">Slack ↗</a>' : '') + '</span></div>' +
+        '<div class="c-title">' + esc(a.title || '(no title)') + '</div>' + dueHtml(a) + notes + '</article>';
+    }
+    var lbl = pick[1] + ' shift, ' + fmtDay(pick[0], true);
+    $('h-body').innerHTML = !rows.length
+      ? '<div class="empty"><b>No updates logged</b>Nobody added an update for the ' + esc(lbl) + '.</div>'
+      : '<p class="r-sub">' + esc(lbl) + ': ' + rows.length + ' AXO' + (rows.length === 1 ? '' : 's') + ' updated by ' + Object.keys(qas).length + ' QA' + (Object.keys(qas).length === 1 ? '' : 's') + '. Click an AXO to open it.</p>' +
+        (open.length ? '<h3 class="h-sec">Still open, pick these up · ' + open.length + '</h3><div class="h-list">' + open.map(item).join('') + '</div>' : '') +
+        (done.length ? '<h3 class="h-sec">Passed or closed · ' + done.length + '</h3><div class="h-list">' + done.map(item).join('') + '</div>' : '');
+    $('count').textContent = '';
   }
 
   /* ---------- reports ---------- */
@@ -507,10 +568,10 @@
   function renderDetail() {
     var el = $('detail'), shell = $('shell');
     var a = S.byNum[S.open];
-    if (S.queue === 'reports') a = null;
+    if (isView(S.queue)) a = null;
     if (!a) {
       S.open = '';
-      el.hidden = S.queue === 'reports' || window.matchMedia('(max-width:1240px)').matches;
+      el.hidden = isView(S.queue) || window.matchMedia('(max-width:1240px)').matches;
       $('scrim').hidden = true;
       shell.classList.toggle('no-detail', el.hidden);
       el.innerHTML = '<div class="d-empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>' +
@@ -715,13 +776,21 @@
     function pickQueue(e) {
       var b = e.target.closest('[data-queue]'); if (!b) return;
       var was = S.queue; S.queue = b.getAttribute('data-queue'); savePrefs(); renderRail(); renderBoard();
-      if (was === 'reports' || S.queue === 'reports') renderDetail();
+      if (isView(was) || isView(S.queue)) renderDetail();
     }
     $('queues').onclick = pickQueue; $('stats').onclick = pickQueue;
-    $('reports-btn').onclick = function () {
+    function openView(v) {
       if (S.dirty && !confirmDiscard()) return;
-      S.queue = 'reports'; S.open = ''; S.composerFor = ''; S.dirty = false; savePrefs(); renderRail(); renderBoard(); renderDetail();
+      S.queue = v; S.open = ''; S.composerFor = ''; S.dirty = false; savePrefs(); renderRail(); renderBoard(); renderDetail();
       window.scrollTo(0, 0);
+    }
+    $('reports-btn').onclick = function () { openView('reports'); };
+    $('handover-btn').onclick = function () { S.hoPick = ''; openView('handover'); };
+    $('h-shift').addEventListener('change', function () { S.hoPick = $('h-shift').value; renderHandover(); });
+    $('h-body').onclick = function (e) {
+      var c = e.target.closest('[data-open]'); if (!c || e.target.closest('a')) return;
+      var a = S.byNum[c.getAttribute('data-open')]; if (!a) return;
+      S.queue = a.closed ? 'closed' : 'active'; S.qa = ''; savePrefs(); renderRail(); openDetail(a.axoNumber); window.scrollTo(0, 0);
     };
     ['r-range', 'r-from', 'r-to'].forEach(function (id) { $(id).addEventListener('change', function () { savePrefs(); renderReports(); }); });
     $('r-copy').onclick = function () {
@@ -741,6 +810,7 @@
     ['f-prio', 'f-client', 'f-sort'].forEach(function (id) { $(id).addEventListener('change', function () { savePrefs(); renderBoard(); }); });
 
     $('cards').onclick = function (e) {
+      if (e.target.closest('a')) return;
       var u = e.target.closest('[data-update]'); if (u) { openDetail(u.getAttribute('data-update'), true); return; }
       var c = e.target.closest('[data-open]'); if (c) openDetail(c.getAttribute('data-open'));
     };

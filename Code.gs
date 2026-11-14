@@ -22,7 +22,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-14.2';
+var BUILD = '2026-11-14.3';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
