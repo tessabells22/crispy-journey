@@ -178,7 +178,7 @@
 
   /* ---------- header ---------- */
   function renderHeader() {
-    var cs = currentShift(), m = me();
+    var m = me(), cs = m ? myShift() : currentShift();
     var d = new Date(cs.date + 'T00:00:00Z');
     $('shift-line').textContent = cs.shift + ' shift · ' + d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
     var needs = all().filter(queueDef('needs').test).length;
@@ -530,8 +530,16 @@
     return true;
   }
 
+  // The shift a QA is logging for: their usual shift (QAs tab) at its most
+  // recent start, e.g. a Night QA at 9 AM gets last night; otherwise the clock.
+  function myShift() {
+    var cs = currentShift(), usual = (S.data.qaShifts || {})[me()];
+    if (!usual) return cs;
+    for (var i = 0, sd = cs; i < 3; i++, sd = prevShift(sd)) if (sd.shift === usual) return sd;
+    return cs;
+  }
   function composerHtml(a, u) {
-    var cs = currentShift();
+    var cs = myShift();
     var status = u ? u.status : (a.latest ? a.latest.status : 'In Progress');
     var date = u ? u.shiftDate : cs.date, shift = u ? u.shift : cs.shift;
     var chips = S.data.statuses.map(function (s, i) {

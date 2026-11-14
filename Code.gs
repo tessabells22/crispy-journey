@@ -22,7 +22,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-14.3';
+var BUILD = '2026-11-14.4';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
@@ -35,7 +35,7 @@ var UPDATE_HEADERS = ['Id', 'AxoNumber', 'QA', 'ShiftDate', 'Shift', 'Status', '
   'Files', 'CreatedAt', 'UpdatedAt'];
 
 var QA_SHEET = 'QAs';
-var QA_HEADERS = ['Name', 'Active'];
+var QA_HEADERS = ['Name', 'Active', 'Shift'];
 
 var SHIFTS = ['Day', 'Mid', 'Night'];
 var STATUSES = ['Not Tested', 'In Progress', 'Passed - Initial', 'Passed - Develop/Deployment',
@@ -326,6 +326,91 @@ function slackTeamUrl_() {
   return url;
 }
 
+/* ---------- new-AXO notifications ----------
+   Posts each newly added AXO to the QA channel. Uses SLACK_NOTIFY_WEBHOOK (an
+   Incoming Webhook for #endorsement-npd-qa) when set; otherwise
+   chat.postMessage to SLACK_NOTIFY_CHANNEL with the user token, which needs
+   the chat:write scope. Off when neither is set. Only posts AXOs whose Slack
+   post is under a day old, and at most NOTIFY_MAX per run, so a backfill or a
+   re-scan never floods the channel. */
+var NOTIFY_MAX = 8;
+
+function slackEsc_(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function newAxoMessage_(a, trackerUrl, threadUrl) {
+  var head = ':new: *New AXO ' + slackEsc_(a.AxoNumber) + '*' + (a.Priority ? ' · ' + slackEsc_(String(a.Priority).split(/[\s(]/)[0].toUpperCase()) : '');
+  var facts = [];
+  if (a.DueDate || a.DueDateRaw) facts.push('Due ' + slackEsc_(a.DueDate || a.DueDateRaw));
+  if (a.Client) facts.push('Client ' + slackEsc_(a.Client));
+  if (a.RaisedBy) facts.push('Raised by ' + slackEsc_(a.RaisedBy));
+  var links = [];
+  if (trackerUrl) links.push('<' + trackerUrl + '|Open the tracker>');
+  if (threadUrl) links.push('<' + threadUrl + '|Slack thread>');
+  if (/^https?:\/\//.test(String(a.Link || ''))) links.push('<' + a.Link + '|Axosoft>');
+  return [head, slackEsc_(a.Title || ''), facts.join(' · '), links.join(' · ')].filter(Boolean).join('\n');
+}
+
+function notifyNewAxos_(numbers) {
+  var hook = prop_('SLACK_NOTIFY_WEBHOOK'), channel = prop_('SLACK_NOTIFY_CHANNEL');
+  if (!numbers || !numbers.length || (!hook && !channel)) return 0;
+  var want = {}; numbers.forEach(function (n) { want[n] = true; });
+  var dayAgo = new Date(Date.now() - 864e5).toISOString();
+  var rows = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) {
+    return want[r.AxoNumber] && (r.Source === 'paste' || String(r.PostedAt || r.CreatedAt) >= dayAgo);
+  });
+  if (!rows.length) return 0;
+  var trackerUrl = '';
+  try { trackerUrl = ScriptApp.getService().getUrl() || ''; } catch (e) {}
+  var team = slackTeamUrl_(), src = prop_('SLACK_CHANNEL_ID');
+  var texts = rows.slice(0, NOTIFY_MAX).map(function (r) {
+    var thread = team && src && /^\d+\.\d+$/.test(String(r.SlackTs)) ? team.replace(/\/?$/, '/') + 'archives/' + src + '/p' + String(r.SlackTs).replace('.', '') : '';
+    return newAxoMessage_(r, trackerUrl, thread);
+  });
+  if (rows.length > NOTIFY_MAX) texts.push('…and ' + (rows.length - NOTIFY_MAX) + ' more new AXOs.' + (trackerUrl ? ' <' + trackerUrl + '|Open the tracker>' : ''));
+  var sent = 0;
+  texts.forEach(function (text) {
+    try {
+      if (hook) {
+        var res = UrlFetchApp.fetch(hook, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ text: text }), muteHttpExceptions: true });
+        if (res.getResponseCode() >= 300) throw new Error('webhook ' + res.getResponseCode() + ' ' + res.getContentText());
+      } else {
+        var r = JSON.parse(UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+          method: 'post', contentType: 'application/json; charset=utf-8', muteHttpExceptions: true,
+          headers: { Authorization: 'Bearer ' + prop_('SLACK_USER_TOKEN') },
+          payload: JSON.stringify({ channel: channel, text: text, unfurl_links: false })
+        }).getContentText());
+        if (!r.ok) throw new Error(r.error);
+      }
+      sent++;
+    } catch (e) {
+      setProp_('SLACK_NOTIFY_ERROR', JSON.stringify({ at: nowIso_(), error: e.message }));
+      console.warn('notify failed: ' + e.message);
+    }
+  });
+  return sent;
+}
+
+/* Run from the editor to post one test message for the newest AXO. */
+function testNewAxoNotification() {
+  var rows = readRows_(AXO_SHEET, AXO_HEADERS);
+  if (!rows.length) throw new Error('No AXOs yet.');
+  rows.sort(function (a, b) { return String(b.PostedAt || b.CreatedAt).localeCompare(String(a.PostedAt || a.CreatedAt)); });
+  var r = rows[0];
+  var trackerUrl = ''; try { trackerUrl = ScriptApp.getService().getUrl() || ''; } catch (e) {}
+  var text = '(test) ' + newAxoMessage_(r, trackerUrl, '');
+  var hook = prop_('SLACK_NOTIFY_WEBHOOK'), channel = prop_('SLACK_NOTIFY_CHANNEL');
+  if (!hook && !channel) throw new Error('Set SLACK_NOTIFY_WEBHOOK (or SLACK_NOTIFY_CHANNEL) in Script Properties first.');
+  if (hook) {
+    var res = UrlFetchApp.fetch(hook, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ text: text }), muteHttpExceptions: true });
+    console.log('Webhook answered ' + res.getResponseCode() + ' ' + res.getContentText());
+  } else {
+    console.log(UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+      method: 'post', contentType: 'application/json; charset=utf-8', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + prop_('SLACK_USER_TOKEN') }, payload: JSON.stringify({ channel: channel, text: text })
+    }).getContentText());
+  }
+}
+
 /* Time-trigger entry point. Re-scans a short window so dev-assignee thread
    replies that arrive after the post are still picked up. */
 function syncSlack() {
@@ -340,6 +425,7 @@ function syncSlack() {
     var last = Number(prop_('SLACK_LAST_TS') || 0);
     var oldest = last ? last - windowDays * 86400 : Date.now() / 1000 - windowDays * 86400;
     var r = syncSince_(oldest);
+    notifyNewAxos_(r.added);
     console.log('syncSlack: added ' + r.added.join(',') + ' updated ' + r.updated.join(','));
   } catch (e) {
     setProp_('SLACK_LAST_ERROR', JSON.stringify({ at: nowIso_(), error: e.message }));
@@ -507,6 +593,10 @@ function testSlackConnection() {
 /* ============================================================
    WEB APP API (google.script.run)
    ============================================================ */
+function activeQas_() {
+  return readRows_(QA_SHEET, QA_HEADERS).filter(function (r) { return r.Name && String(r.Active).toLowerCase() !== 'false'; });
+}
+
 function apiBootstrap() {
   var sync = {}, err = {};
   try { sync = JSON.parse(prop_('SLACK_LAST_SYNC') || '{}'); } catch (e) {}
@@ -515,9 +605,13 @@ function apiBootstrap() {
     build: BUILD,
     axos: readRows_(AXO_SHEET, AXO_HEADERS).map(axoFromRow_),
     updates: readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_),
-    qas: readRows_(QA_SHEET, QA_HEADERS)
-      .filter(function (r) { return r.Name && String(r.Active).toLowerCase() !== 'false'; })
-      .map(function (r) { return r.Name; }),
+    qas: activeQas_().map(function (r) { return r.Name; }),
+    // Each QA's usual shift (QAs tab, Shift column), used to pre-fill the update form.
+    qaShifts: activeQas_().reduce(function (m, r) {
+      var sh = String(r.Shift || '').trim().replace(/^./, function (c) { return c.toUpperCase(); });
+      if (SHIFTS.indexOf(sh) >= 0) m[r.Name] = sh;
+      return m;
+    }, {}),
     statuses: STATUSES, shifts: SHIFTS,
     slack: {
       configured: !!(prop_('SLACK_USER_TOKEN') && prop_('SLACK_CHANNEL_ID')), lastSync: sync, lastError: err,
@@ -537,6 +631,7 @@ function apiPasteAxo(text) {
   var axo = parseAxoPost(String(text || '').slice(0, 20000));
   if (!axo) throw new Error('No AXO number found. Paste the whole Slack post, starting from "Axo Number".');
   var r = upsertAxos_([axo], 'paste');
+  notifyNewAxos_(r.added);
   return { axo: axo, added: r.added.length > 0, updated: r.updated.length > 0 };
 }
 

@@ -45,7 +45,7 @@ Failed - Initial, Failed - Develop/Deployment, Needs Monitoring, Urgent/High Pri
 4. Add three HTML files named exactly **`Index`**, **`Styles`**, **`Script`** and paste the matching files.
 5. **Project Settings > Show "appsscript.json"**, then paste this repo's `appsscript.json`.
 6. Reload the Sheet. An **AXO Tracker** menu appears. Run **AXO Tracker > Set up tabs** and approve the permissions.
-7. In the **QAs** tab, list the QA names in column A (one per row). Put `FALSE` in column B to hide someone who left.
+7. In the **QAs** tab, list the QA names in column A (one per row). Put `FALSE` in column B to hide someone who left. Column C (`Shift`) is the QA's usual shift (Day, Mid or Night); the update form starts on that shift.
 
 ### 2. Slack sync (skip if you can't install a Slack app; Paste AXO still works)
 
@@ -65,6 +65,9 @@ channel and the workflow is not changed.
 |---|---|
 | `SLACK_USER_TOKEN` | the `xoxp-…` token |
 | `SLACK_CHANNEL_ID` | the channel ID |
+| `SLACK_NOTIFY_WEBHOOK` | optional: Incoming Webhook URL for #endorsement-npd-qa. Each new AXO is posted there (at most 8 per sync; backfills never post). Run `testNewAxoNotification` to check it. |
+| `SLACK_NOTIFY_CHANNEL` | optional, used only without a webhook: channel ID to post to with the user token (needs the `chat:write` user scope). |
+| `SYNC_EVERY_MIN` | optional, default `3`: minutes between Slack syncs. |
 | `SLACK_REPLY_WINDOW_DAYS` | optional, default `3`: how many days back each run re-checks for late "assigned to" replies |
 
 6. In the Sheet: **AXO Tracker > Test Slack connection**. Check **Executions** in Apps Script:

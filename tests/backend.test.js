@@ -165,4 +165,32 @@ t('bootstrap gives a Slack thread base from auth.test', () => {
   assert.strictEqual(g.ctx.apiBootstrap().slack.threadBase, 'https://acme.slack.com/archives/G1/p');
 });
 
+t('new AXOs from sync are posted to the notify webhook, backfill is not', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1', SLACK_NOTIFY_WEBHOOK: 'https://hooks.slack.com/services/T/B/X' } });
+  const posts = [];
+  const now = (Date.now() / 1000).toFixed(6), old = (Date.now() / 1000 - 10 * 86400).toFixed(6);
+  g.setFetch((url, o) => {
+    if (/hooks.slack.com/.test(url)) { posts.push(JSON.parse(o.payload).text); return { code: 200, body: 'ok' }; }
+    if (/auth.test/.test(url)) return { body: { ok: true, url: 'https://acme.slack.com/' } };
+    return slackFake([{ ts: now, text: post(16001) }, { ts: old, text: post(16002) }])(url);
+  });
+  g.ctx.syncSlack();
+  assert.strictEqual(posts.length, 1);
+  assert.ok(/New AXO 16001/.test(posts[0]) && /HIGH/.test(posts[0]) && /archives\/G1\/p/.test(posts[0]));
+  g.props.SLACK_LAST_TS = '';
+  g.ctx.syncSlack(); // nothing new
+  g.ctx.backfillSlack(30);
+  assert.strictEqual(posts.length, 1);
+  g.ctx.apiPasteAxo('Axo Number: 16003 - [Backend] - Pasted');
+  assert.strictEqual(posts.length, 2);
+});
+
+t('bootstrap returns each QA\'s usual shift', () => {
+  const g = loadGas();
+  g.ctx.setupSheets();
+  const sh = g.ss.getSheetByName('QAs');
+  sh.getRange(2, 1, 3, 3).setValues([['Tessa', '', 'Night'], ['EJ', '', 'day'], ['Aaron', '', '']]);
+  assert.deepStrictEqual(plain(g.ctx.apiBootstrap().qaShifts), { Tessa: 'Night', EJ: 'Day' });
+});
+
 console.log(n + ' tests passed');
