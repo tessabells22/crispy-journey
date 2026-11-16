@@ -9,9 +9,8 @@
      • Updates  — one row per QA update on an AXO (history kept)
      • QAs      — the QA name list for the "Who are you?" picker
 
-   Ingestion (both paths go through Parser.gs → upsertAxos_):
+   Ingestion (through Parser.gs → upsertAxos_):
      • syncSlack()    — time trigger, Slack conversations.history
-     • apiPasteAxo()  — "Paste AXO" box in the web app
 
    Script Properties (Project Settings > Script Properties):
      • SLACK_USER_TOKEN   xoxp-… user token (scopes: groups:history,
@@ -22,7 +21,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-13.1';
+var BUILD = '2026-11-16.1';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
@@ -35,13 +34,13 @@ var UPDATE_HEADERS = ['Id', 'AxoNumber', 'QA', 'ShiftDate', 'Shift', 'Status', '
   'Files', 'CreatedAt', 'UpdatedAt'];
 
 var QA_SHEET = 'QAs';
-var QA_HEADERS = ['Name', 'Active'];
+var QA_HEADERS = ['Name', 'Active', 'Shift'];
 
 var SHIFTS = ['Day', 'Mid', 'Night'];
 var STATUSES = ['Not Tested', 'In Progress', 'Passed - Initial', 'Passed - Develop/Deployment',
   'Failed - Initial', 'Failed - Develop/Deployment', 'Needs Monitoring', 'Urgent/High Prio', 'Blocked'];
-/* An update with one of these statuses closes the AXO (Reopen undoes it). */
-var AUTO_CLOSE_STATUSES = ['Passed - Develop/Deployment'];
+/* Which status closes an AXO lives in closesAxo() in Parser.gs:
+   Passed - Develop/Deployment for all, Passed - Initial for [Backend]. Reopen undoes it. */
 
 /* ============================================================
    WEB APP
@@ -63,7 +62,7 @@ function onOpen() {
     .addItem('Set up tabs', 'setupSheets')
     .addItem('Test Slack connection', 'testSlackConnection')
     .addItem('Import last 30 days from Slack', 'backfillSlack')
-    .addItem('Start auto-sync (every 5 min)', 'setupSlackSync')
+    .addItem('Start auto-sync (every 3 min)', 'setupSlackSync')
     .addItem('Sync now', 'syncSlack')
     .addToUi();
 }
@@ -102,7 +101,8 @@ function readRows_(name, headers) {
     var o = { _row: i + 2 };
     headers.forEach(function (h, j) {
       var v = row[j];
-      if (Object.prototype.toString.call(v) === '[object Date]') v = Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+      // Timestamp columns (…At) keep their time; date columns become YYYY-MM-DD.
+      if (Object.prototype.toString.call(v) === '[object Date]') v = /At$/.test(h) ? v.toISOString() : Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
       o[h] = v === null || v === undefined ? '' : String(v);
     });
     return o;
@@ -202,7 +202,7 @@ function setProp_(k, v) { PropertiesService.getScriptProperties().setProperty(k,
 function slackApi_(method, params) {
   var token = prop_('SLACK_USER_TOKEN');
   if (!token) throw new Error('SLACK_USER_TOKEN is not set in Script Properties.');
-  var qs = Object.keys(params || {}).map(function (k) {
+  var qs = Object.keys(params || {}).filter(function (k) { return params[k] != null && params[k] !== ''; }).map(function (k) {
     return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
   }).join('&');
   for (var attempt = 0; attempt < 3; attempt++) {
@@ -262,14 +262,15 @@ function messageText_(msg) {
 function tsToIso_(ts) { return new Date(Number(ts) * 1000).toISOString(); }
 
 /* Fetch posts since `oldestTs`, parse them, pull assignee replies, upsert. */
-function syncSince_(oldestTs) {
+function syncSince_(oldestTs, opts) {
+  opts = opts || {};
   var channel = prop_('SLACK_CHANNEL_ID');
   if (!channel) throw new Error('SLACK_CHANNEL_ID is not set in Script Properties.');
 
   var messages = [], cursor = '';
   do {
     var page = slackApi_('conversations.history', {
-      channel: channel, oldest: String(oldestTs), limit: 200, cursor: cursor
+      channel: channel, oldest: String(oldestTs), latest: opts.latest ? String(opts.latest) : undefined, limit: 200, cursor: cursor
     });
     messages = messages.concat(page.messages || []);
     cursor = (page.response_metadata && page.response_metadata.next_cursor) || '';
@@ -282,7 +283,7 @@ function syncSince_(oldestTs) {
     var text = messageText_(msg);
     var ids = mentionIds_(text);
     var replies = [];
-    if (msg.reply_count) {
+    if (msg.reply_count && !opts.noReplies) {
       try {
         replies = (slackApi_('conversations.replies', { channel: channel, ts: msg.ts, limit: 100 }).messages || [])
           .filter(function (r) { return r.ts !== msg.ts; })
@@ -314,9 +315,107 @@ function syncSince_(oldestTs) {
   return result;
 }
 
+/* Workspace URL (e.g. https://acme.slack.com/), cached from auth.test so the
+   web app can link each AXO to its Slack post. '' when Slack isn't set up. */
+function slackTeamUrl_() {
+  var url = prop_('SLACK_TEAM_URL');
+  if (url || !prop_('SLACK_USER_TOKEN')) return url || '';
+  try { url = slackApi_('auth.test', {}).url || ''; } catch (e) { return ''; }
+  if (url) setProp_('SLACK_TEAM_URL', url);
+  return url;
+}
+
+/* ---------- new-AXO notifications ----------
+   Posts each newly added AXO to the QA channel. Uses SLACK_NOTIFY_WEBHOOK (an
+   Incoming Webhook for #endorsement-npd-qa) when set; otherwise
+   chat.postMessage to SLACK_NOTIFY_CHANNEL with the user token, which needs
+   the chat:write scope. Off when neither is set. Only posts AXOs whose Slack
+   post is under a day old, and at most NOTIFY_MAX per run, so a backfill or a
+   re-scan never floods the channel. */
+var NOTIFY_MAX = 8;
+
+function slackEsc_(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function newAxoMessage_(a, trackerUrl, threadUrl) {
+  var head = ':new: *New AXO ' + slackEsc_(a.AxoNumber) + '*' + (a.Priority ? ' · ' + slackEsc_(String(a.Priority).split(/[\s(]/)[0].toUpperCase()) : '');
+  var facts = [];
+  if (a.DueDate || a.DueDateRaw) facts.push('Due ' + slackEsc_(a.DueDate || a.DueDateRaw));
+  if (a.Client) facts.push('Client ' + slackEsc_(a.Client));
+  if (a.RaisedBy) facts.push('Raised by ' + slackEsc_(a.RaisedBy));
+  var links = [];
+  if (trackerUrl) links.push('<' + trackerUrl + '|Open the tracker>');
+  if (threadUrl) links.push('<' + threadUrl + '|Slack thread>');
+  if (/^https?:\/\//.test(String(a.Link || ''))) links.push('<' + a.Link + '|Axosoft>');
+  return [head, slackEsc_(a.Title || ''), facts.join(' · '), links.join(' · ')].filter(Boolean).join('\n');
+}
+
+function notifyNewAxos_(numbers) {
+  var hook = prop_('SLACK_NOTIFY_WEBHOOK'), channel = prop_('SLACK_NOTIFY_CHANNEL');
+  if (!numbers || !numbers.length || (!hook && !channel)) return 0;
+  var want = {}; numbers.forEach(function (n) { want[n] = true; });
+  var dayAgo = new Date(Date.now() - 864e5).toISOString();
+  var rows = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) {
+    return want[r.AxoNumber] && String(r.PostedAt || r.CreatedAt) >= dayAgo;
+  });
+  if (!rows.length) return 0;
+  var trackerUrl = '';
+  try { trackerUrl = ScriptApp.getService().getUrl() || ''; } catch (e) {}
+  var team = slackTeamUrl_(), src = prop_('SLACK_CHANNEL_ID');
+  var texts = rows.slice(0, NOTIFY_MAX).map(function (r) {
+    var thread = team && src && /^\d+\.\d+$/.test(String(r.SlackTs)) ? team.replace(/\/?$/, '/') + 'archives/' + src + '/p' + String(r.SlackTs).replace('.', '') : '';
+    return newAxoMessage_(r, trackerUrl, thread);
+  });
+  if (rows.length > NOTIFY_MAX) texts.push('…and ' + (rows.length - NOTIFY_MAX) + ' more new AXOs.' + (trackerUrl ? ' <' + trackerUrl + '|Open the tracker>' : ''));
+  var sent = 0;
+  texts.forEach(function (text) {
+    try {
+      if (hook) {
+        var res = UrlFetchApp.fetch(hook, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ text: text }), muteHttpExceptions: true });
+        if (res.getResponseCode() >= 300) throw new Error('webhook ' + res.getResponseCode() + ' ' + res.getContentText());
+      } else {
+        var r = JSON.parse(UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+          method: 'post', contentType: 'application/json; charset=utf-8', muteHttpExceptions: true,
+          headers: { Authorization: 'Bearer ' + prop_('SLACK_USER_TOKEN') },
+          payload: JSON.stringify({ channel: channel, text: text, unfurl_links: false })
+        }).getContentText());
+        if (!r.ok) throw new Error(r.error);
+      }
+      sent++;
+    } catch (e) {
+      setProp_('SLACK_NOTIFY_ERROR', JSON.stringify({ at: nowIso_(), error: e.message }));
+      console.warn('notify failed: ' + e.message);
+    }
+  });
+  return sent;
+}
+
+/* Run from the editor to post one test message for the newest AXO. */
+function testNewAxoNotification() {
+  var rows = readRows_(AXO_SHEET, AXO_HEADERS);
+  if (!rows.length) throw new Error('No AXOs yet.');
+  rows.sort(function (a, b) { return String(b.PostedAt || b.CreatedAt).localeCompare(String(a.PostedAt || a.CreatedAt)); });
+  var r = rows[0];
+  var trackerUrl = ''; try { trackerUrl = ScriptApp.getService().getUrl() || ''; } catch (e) {}
+  var text = '(test) ' + newAxoMessage_(r, trackerUrl, '');
+  var hook = prop_('SLACK_NOTIFY_WEBHOOK'), channel = prop_('SLACK_NOTIFY_CHANNEL');
+  if (!hook && !channel) throw new Error('Set SLACK_NOTIFY_WEBHOOK (or SLACK_NOTIFY_CHANNEL) in Script Properties first.');
+  if (hook) {
+    var res = UrlFetchApp.fetch(hook, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ text: text }), muteHttpExceptions: true });
+    console.log('Webhook answered ' + res.getResponseCode() + ' ' + res.getContentText());
+  } else {
+    console.log(UrlFetchApp.fetch('https://slack.com/api/chat.postMessage', {
+      method: 'post', contentType: 'application/json; charset=utf-8', muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + prop_('SLACK_USER_TOKEN') }, payload: JSON.stringify({ channel: channel, text: text })
+    }).getContentText());
+  }
+}
+
 /* Time-trigger entry point. Re-scans a short window so dev-assignee thread
    replies that arrive after the post are still picked up. */
 function syncSlack() {
+  // Apps Script timers only run every 1/5/10/15/30 min, so the trigger fires
+  // every minute and this skips until SYNC_EVERY_MIN (default 3) has passed.
+  if (!syncDue_()) return;
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return; // a previous run is still going
   lock.releaseLock();
@@ -325,11 +424,21 @@ function syncSlack() {
     var last = Number(prop_('SLACK_LAST_TS') || 0);
     var oldest = last ? last - windowDays * 86400 : Date.now() / 1000 - windowDays * 86400;
     var r = syncSince_(oldest);
+    notifyNewAxos_(r.added);
     console.log('syncSlack: added ' + r.added.join(',') + ' updated ' + r.updated.join(','));
   } catch (e) {
     setProp_('SLACK_LAST_ERROR', JSON.stringify({ at: nowIso_(), error: e.message }));
     console.error('syncSlack: ' + e.message);
   }
+}
+
+function syncDue_() {
+  var every = Number(prop_('SYNC_EVERY_MIN') || 3);
+  var last = {};
+  try { last = JSON.parse(prop_('SLACK_LAST_SYNC') || '{}'); } catch (e) {}
+  if (!last.at) return true;
+  // 20 s of slack so a run that lands a few seconds early isn't pushed a whole minute.
+  return Date.now() - new Date(last.at).getTime() >= every * 60000 - 20000;
 }
 
 /* Run once from the editor to import history. Default 30 days. */
@@ -343,13 +452,14 @@ function backfillSlack(days) {
 /* One-time cleanup after a backfill: closes active AXOs with no QA update
    whose due date is before `beforeIso` (default: today in Manila), or every
    such AXO when `all` is true. Reversible with Reopen in the web app. */
-function closeImportedAxos(beforeIso, all) {
+function closeImportedAxos(beforeIso, all, createdAfterIso) {
   var cutoff = beforeIso || Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
   var touched = {};
   readRows_(UPDATE_SHEET, UPDATE_HEADERS).forEach(function (u) { touched[u.AxoNumber] = true; });
   var sh = sheet_(AXO_SHEET, AXO_HEADERS), now = nowIso_(), n = 0;
   readRows_(AXO_SHEET, AXO_HEADERS).forEach(function (r) {
     if ((r.State || 'Active') !== 'Active' || touched[r.AxoNumber]) return;
+    if (createdAfterIso && !(String(r.CreatedAt) > createdAfterIso)) return;
     if (!all && !(r.DueDate && r.DueDate < cutoff)) return;
     sh.getRange(r._row, AXO_HEADERS.indexOf('State') + 1).setValue('Closed');
     sh.getRange(r._row, AXO_HEADERS.indexOf('ClosedAt') + 1).setValue(now);
@@ -361,13 +471,112 @@ function closeImportedAxos(beforeIso, all) {
 }
 function closeAllImportedAxos() { return closeImportedAxos('', true); }
 
-/* Run once from the editor: installs a 5-minute syncSlack trigger. */
+/* One-time sweep for the [Backend] rule: closes every active AXO whose latest
+   update already meets closesAxo(). Safe to re-run. */
+function closePassedAxos() {
+  var byAxo = {};
+  readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_).forEach(function (u) { (byAxo[u.axoNumber] = byAxo[u.axoNumber] || []).push(u); });
+  var closed = [];
+  readRows_(AXO_SHEET, AXO_HEADERS).forEach(function (r) {
+    if ((r.State || 'Active') !== 'Active') return;
+    var latest = latestUpdate(byAxo[r.AxoNumber]);
+    if (latest && closesAxo(r.Title, latest.status)) { setAxoState_(r.AxoNumber, 'Closed'); closed.push(r.AxoNumber); }
+  });
+  console.log('Closed ' + closed.length + ' AXOs: ' + closed.join(', '));
+  return closed;
+}
+
+/* ---------- one-time import from the old Endorsement Tracker ----------
+   Reads the old tracker's "Endorsements" sheet (read only: nothing is ever
+   written there) and adds each AXO line as an update on the matching AXO
+   here. Safe to re-run: updates carry stable "legacy-…" ids. Afterwards each
+   touched AXO follows the normal rule: latest status "Passed -
+   Develop/Deployment" closes it, anything else keeps it (or puts it back)
+   in the active list. AXOs the old tracker has but this one doesn't are
+   reported, not created. */
+var OLD_TRACKER_SHEET_ID = '1WSI1MeqS421MSfTvh2HewJtBi9HVMKcib4EHJOCu8s0';
+
+function importEndorsementHistory() {
+  var src = SpreadsheetApp.openById(prop_('OLD_TRACKER_SHEET_ID') || OLD_TRACKER_SHEET_ID).getSheetByName('Endorsements');
+  if (!src) throw new Error('No "Endorsements" tab in the old tracker sheet.');
+  var values = src.getDataRange().getValues().slice(1).map(function (row) {
+    return row.map(function (v, j) {
+      if (Object.prototype.toString.call(v) !== '[object Date]') return v;
+      return j === 1 ? Utilities.formatDate(v, TZ, 'yyyy-MM-dd') : v.toISOString();
+    });
+  });
+  var legacy = legacyUpdatesFrom(values);
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var axoRows = readRows_(AXO_SHEET, AXO_HEADERS), known = {};
+    axoRows.forEach(function (r) { known[r.AxoNumber] = r; });
+    var existing = readRows_(UPDATE_SHEET, UPDATE_HEADERS), have = {};
+    existing.forEach(function (r) { have[r.Id] = true; });
+
+    var add = [], missing = {}, touched = {};
+    legacy.forEach(function (u) {
+      if (have[u.id]) return;
+      if (!known[u.axoNumber]) { missing[u.axoNumber] = true; return; }
+      if (STATUSES.indexOf(u.status) < 0) u.status = 'In Progress';
+      if (SHIFTS.indexOf(u.shift) < 0) u.shift = 'Day';
+      add.push(rowValues_(updateToRow_(u.id, u, u.createdAt || nowIso_(), u.updatedAt || u.createdAt || nowIso_()), UPDATE_HEADERS));
+      touched[u.axoNumber] = true;
+    });
+    if (add.length) {
+      var sh = sheet_(UPDATE_SHEET, UPDATE_HEADERS);
+      sh.getRange(sh.getLastRow() + 1, 1, add.length, UPDATE_HEADERS.length).setNumberFormat('@').setValues(add);
+    }
+
+    var all = readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_), byAxo = {};
+    all.forEach(function (u) { (byAxo[u.axoNumber] = byAxo[u.axoNumber] || []).push(u); });
+    var closed = [], reopened = [];
+    Object.keys(touched).forEach(function (num) {
+      var latest = latestUpdate(byAxo[num]);
+      var want = latest && closesAxo(known[num].Title, latest.status) ? 'Closed' : 'Active';
+      var was = known[num].State || 'Active';
+      if (was === want) return;
+      setAxoState_(num, want);
+      (want === 'Closed' ? closed : reopened).push(num);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  var summary = {
+    updatesAdded: add.length, axosTouched: Object.keys(touched).length,
+    closed: closed.length, reopened: reopened.length, notInTracker: Object.keys(missing).sort()
+  };
+  console.log('Imported ' + summary.updatesAdded + ' updates on ' + summary.axosTouched + ' AXOs. Closed ' + summary.closed +
+    ', reopened ' + summary.reopened + '. Not in this tracker (' + summary.notInTracker.length + '): ' + summary.notInTracker.join(', '));
+  return summary;
+}
+
+/* Pull older AXOs from Slack so the import above can match them, then close
+   the newly added ones that are overdue and have no QA history. */
+function backfillForImport() {
+  var started = nowIso_(), now = Date.now() / 1000;
+  // Only the older stretch the 30-day import didn't cover, and without thread
+  // replies: Slack rate-limits those, and one call per post would not finish
+  // inside Apps Script's 6-minute limit. Dev assignees on these old AXOs stay blank.
+  var lastTs = prop_('SLACK_LAST_TS');
+  var r0 = syncSince_(now - Number(prop_('IMPORT_BACKFILL_DAYS') || 75) * 86400, { latest: now - 28 * 86400, noReplies: true });
+  if (lastTs) setProp_('SLACK_LAST_TS', lastTs);
+  console.log('older backfill: added ' + r0.added.length + ', updated ' + r0.updated.length);
+  var r = importEndorsementHistory();
+  var n = closeImportedAxos('', false, started);
+  console.log('Closed ' + n + ' newly backfilled AXOs that are overdue with no QA history.');
+  return r;
+}
+
+/* Run once from the editor: installs the syncSlack trigger (fires every
+   minute; syncSlack itself waits SYNC_EVERY_MIN, default 3, between syncs). */
 function setupSlackSync() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'syncSlack') ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('syncSlack').timeBased().everyMinutes(5).create();
-  console.log('syncSlack trigger installed (every 5 minutes).');
+  ScriptApp.newTrigger('syncSlack').timeBased().everyMinutes(1).create();
+  console.log('syncSlack trigger installed (syncs every ' + (prop_('SYNC_EVERY_MIN') || 3) + ' minutes).');
 }
 
 /* Run once from the editor to check the token and channel. */
@@ -383,6 +592,10 @@ function testSlackConnection() {
 /* ============================================================
    WEB APP API (google.script.run)
    ============================================================ */
+function activeQas_() {
+  return readRows_(QA_SHEET, QA_HEADERS).filter(function (r) { return r.Name && String(r.Active).toLowerCase() !== 'false'; });
+}
+
 function apiBootstrap() {
   var sync = {}, err = {};
   try { sync = JSON.parse(prop_('SLACK_LAST_SYNC') || '{}'); } catch (e) {}
@@ -391,30 +604,25 @@ function apiBootstrap() {
     build: BUILD,
     axos: readRows_(AXO_SHEET, AXO_HEADERS).map(axoFromRow_),
     updates: readRows_(UPDATE_SHEET, UPDATE_HEADERS).map(updateFromRow_),
-    qas: readRows_(QA_SHEET, QA_HEADERS)
-      .filter(function (r) { return r.Name && String(r.Active).toLowerCase() !== 'false'; })
-      .map(function (r) { return r.Name; }),
+    qas: activeQas_().map(function (r) { return r.Name; }),
+    // Each QA's usual shift (QAs tab, Shift column), used to pre-fill the update form.
+    qaShifts: activeQas_().reduce(function (m, r) {
+      var sh = String(r.Shift || '').trim().replace(/^./, function (c) { return c.toUpperCase(); });
+      if (SHIFTS.indexOf(sh) >= 0) m[r.Name] = sh;
+      return m;
+    }, {}),
     statuses: STATUSES, shifts: SHIFTS,
-    slack: { configured: !!(prop_('SLACK_USER_TOKEN') && prop_('SLACK_CHANNEL_ID')), lastSync: sync, lastError: err }
+    slack: {
+      configured: !!(prop_('SLACK_USER_TOKEN') && prop_('SLACK_CHANNEL_ID')), lastSync: sync, lastError: err,
+      // Thread link = threadBase + Slack ts without the dot, e.g. …/archives/G123/p1763000000000100
+      threadBase: slackTeamUrl_() && prop_('SLACK_CHANNEL_ID') ? slackTeamUrl_().replace(/\/?$/, '/') + 'archives/' + prop_('SLACK_CHANNEL_ID') + '/p' : ''
+    }
   };
-}
-
-/* Preview what a paste will add, without saving. */
-function apiParseAxo(text) {
-  return parseAxoPost(String(text || '').slice(0, 20000));
-}
-
-/* Paste AXO fallback: same parser as the Slack sync. */
-function apiPasteAxo(text) {
-  var axo = parseAxoPost(String(text || '').slice(0, 20000));
-  if (!axo) throw new Error('No AXO number found. Paste the whole Slack post, starting from "Axo Number".');
-  var r = upsertAxos_([axo], 'paste');
-  return { axo: axo, added: r.added.length > 0, updated: r.updated.length > 0 };
 }
 
 /* Let a QA pull the newest posts now instead of waiting for the trigger. */
 function apiSyncNow() {
-  if (!prop_('SLACK_USER_TOKEN')) throw new Error('Slack sync is not set up yet. Use Paste AXO instead.');
+  if (!prop_('SLACK_USER_TOKEN')) throw new Error('Slack sync is not set up yet.');
   syncSlack();
   return apiBootstrap();
 }
@@ -474,15 +682,15 @@ function apiAddUpdate(update) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var exists = readRows_(AXO_SHEET, AXO_HEADERS).some(function (r) { return r.AxoNumber === u.axoNumber; });
-    if (!exists) throw new Error('AXO ' + u.axoNumber + ' is not in the tracker.');
+    var axo = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) { return r.AxoNumber === u.axoNumber; })[0];
+    if (!axo) throw new Error('AXO ' + u.axoNumber + ' is not in the tracker.');
     var sh = sheet_(UPDATE_SHEET, UPDATE_HEADERS);
     var now = nowIso_();
     var id = Utilities.getUuid();
     sh.getRange(sh.getLastRow() + 1, 1, 1, UPDATE_HEADERS.length)
       .setNumberFormat('@')
       .setValues([rowValues_(updateToRow_(id, u, now, now), UPDATE_HEADERS)]);
-    if (AUTO_CLOSE_STATUSES.indexOf(u.status) >= 0) setAxoState_(u.axoNumber, 'Closed');
+    if (closesAxo(axo.Title, u.status)) setAxoState_(u.axoNumber, 'Closed');
   } finally {
     lock.releaseLock();
   }
@@ -498,7 +706,8 @@ function apiEditUpdate(id, update) {
     if (!row) throw new Error('That update no longer exists.');
     sheet_(UPDATE_SHEET, UPDATE_HEADERS).getRange(row._row, 1, 1, UPDATE_HEADERS.length)
       .setValues([rowValues_(updateToRow_(row.Id, u, row.CreatedAt, nowIso_()), UPDATE_HEADERS)]);
-    if (AUTO_CLOSE_STATUSES.indexOf(u.status) >= 0) setAxoState_(u.axoNumber, 'Closed');
+    var axoRow = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) { return r.AxoNumber === u.axoNumber; })[0];
+    if (axoRow && closesAxo(axoRow.Title, u.status)) setAxoState_(u.axoNumber, 'Closed');
   } finally {
     lock.releaseLock();
   }

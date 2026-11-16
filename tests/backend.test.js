@@ -3,6 +3,7 @@ const assert = require('assert');
 const { loadGas } = require('./fake-gas');
 
 let n = 0;
+function addAxo(g, text) { return plain(g.ctx.upsertAxos_([g.ctx.parseAxoPost(text)], 'slack')); }
 function t(name, fn) { fn(); n++; console.log('ok -', name); }
 const plain = (x) => JSON.parse(JSON.stringify(x));
 
@@ -48,22 +49,27 @@ t('sync errors are recorded, not thrown', () => {
   assert.match(plain(g.ctx.apiBootstrap()).slack.lastError.error, /not_in_channel/);
 });
 
-t('paste adds once and merges blanks without duplicating', () => {
+t('a repeat post merges blanks without duplicating', () => {
   const g = loadGas();
-  const r1 = plain(g.ctx.apiPasteAxo('Axo Number: 15700 - Bug AXO: Paste me\nPriority: Low'));
-  assert.ok(r1.added);
-  const r2 = plain(g.ctx.apiPasteAxo('Axo Number: 15700 - Bug AXO: Paste me\nClient: Globex'));
-  assert.ok(r2.updated && !r2.added);
+  const r1 = addAxo(g, 'Axo Number: 15700 - Bug AXO: Repeat me\nPriority: Low');
+  assert.strictEqual(r1.added.length, 1);
+  const r2 = addAxo(g, 'Axo Number: 15700 - Bug AXO: Repeat me\nClient: Globex');
+  assert.ok(r2.updated.length === 1 && !r2.added.length);
   const axos = plain(g.ctx.apiBootstrap()).axos;
   assert.strictEqual(axos.length, 1);
   assert.strictEqual(axos[0].priority, 'Low');
   assert.strictEqual(axos[0].client, 'Globex');
-  assert.throws(() => g.ctx.apiPasteAxo('no number here'), /No AXO number/);
+});
+
+t('Paste AXO is removed from the server API', () => {
+  const g = loadGas();
+  assert.strictEqual(typeof g.ctx.apiPasteAxo, 'undefined');
+  assert.strictEqual(typeof g.ctx.apiParseAxo, 'undefined');
 });
 
 t('updates: validate, keep history, auto-close, reopen, edit, delete', () => {
   const g = loadGas();
-  g.ctx.apiPasteAxo('Axo Number: 15800 - Bug AXO: Close me');
+  addAxo(g, 'Axo Number: 15800 - Bug AXO: Close me');
   const base = { axoNumber: '15800', qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status: 'In Progress', notes: 'started', files: [{ name: 'TC', url: 'https://drive.google.com/x' }, { name: 'bad', url: 'javascript:alert(1)' }] };
   assert.throws(() => g.ctx.apiAddUpdate(Object.assign({}, base, { status: 'Nope' })), /status/);
   assert.throws(() => g.ctx.apiAddUpdate(Object.assign({}, base, { axoNumber: '1' })), /not in the tracker/);
@@ -94,14 +100,101 @@ t('re-sync never reopens a closed AXO', () => {
 
 t('closeImportedAxos closes overdue untouched AXOs only', () => {
   const g = loadGas();
-  g.ctx.apiPasteAxo('Axo Number: 1001 - Old\nDue Date: 2020-01-01');
-  g.ctx.apiPasteAxo('Axo Number: 1002 - Old but worked\nDue Date: 2020-01-01');
-  g.ctx.apiPasteAxo('Axo Number: 1003 - Future\nDue Date: 2099-01-01');
+  addAxo(g, 'Axo Number: 1001 - Old\nDue Date: 2020-01-01');
+  addAxo(g, 'Axo Number: 1002 - Old but worked\nDue Date: 2020-01-01');
+  addAxo(g, 'Axo Number: 1003 - Future\nDue Date: 2099-01-01');
   g.ctx.apiAddUpdate({ axoNumber: '1002', qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status: 'In Progress', notes: '', files: [] });
   assert.strictEqual(g.ctx.closeImportedAxos('2026-11-14'), 1);
   const st = Object.fromEntries(plain(g.ctx.apiBootstrap()).axos.map(a => [a.axoNumber, a.state]));
   assert.deepStrictEqual(st, { '1001': 'Closed', '1002': 'Active', '1003': 'Active' });
   assert.strictEqual(g.ctx.closeAllImportedAxos(), 1);
+});
+
+t('syncSlack waits SYNC_EVERY_MIN between runs', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1', SYNC_EVERY_MIN: '3' } });
+  let calls = 0;
+  g.setFetch((url) => { if (/conversations.history/.test(url)) calls++; return slackFake([])(url); });
+  g.ctx.syncSlack(); g.ctx.syncSlack();
+  assert.strictEqual(calls, 1);
+  g.props.SLACK_LAST_SYNC = JSON.stringify({ at: new Date(Date.now() - 181000).toISOString() });
+  g.ctx.syncSlack();
+  assert.strictEqual(calls, 2);
+});
+
+t('importEndorsementHistory copies old AXO lines, re-runs safely, fixes open/closed', () => {
+  const OLD = '1WSI1MeqS421MSfTvh2HewJtBi9HVMKcib4EHJOCu8s0';
+  const row = (id, day, shift, qa, sections, at) => [id, day, shift, qa, JSON.stringify({ sections, fileRefs: [] }), at, at];
+  const g = loadGas({ external: { [OLD]: { Endorsements: [
+    ['Id', 'ShiftDate', 'Shift', 'QAResource', 'Payload', 'CreatedAt', 'UpdatedAt'],
+    row('e1', '2026-11-10', 'Day', 'Norma', { workedOn: [{ axo: '2001', status: 'Passed', note: 'ok' }, { axo: '9999', status: 'In Progress' }], nonAxo: [{ note: 'x' }] }, '2026-11-10T02:00:00.000Z'),
+    row('e2', '2026-11-11', 'Night', 'Ervin', { workedOn: [{ axo: '2002 (formerly 1)', status: 'Passed - Develop/Deployment', note: '' }], blocker: [{ axo: '2003', status: 'Blocked', note: 'env down' }] }, '2026-11-11T15:00:00.000Z')
+  ] } } });
+  ['2001', '2002', '2003'].forEach(nm => addAxo(g, 'Axo Number: ' + nm + ' - T\nDue Date: 2020-01-01'));
+  g.ctx.apiSetAxoState('2003', 'Closed'); // e.g. auto-closed as overdue
+  const r = plain(g.ctx.importEndorsementHistory());
+  assert.strictEqual(r.updatesAdded, 3);
+  assert.deepStrictEqual(r.notInTracker, ['9999']);
+  assert.strictEqual(r.closed, 1);   // 2002 passed develop/deployment
+  assert.strictEqual(r.reopened, 1); // 2003 is blocked, back to active
+  const b = plain(g.ctx.apiBootstrap());
+  const st = Object.fromEntries(b.axos.map(a => [a.axoNumber, a.state]));
+  assert.deepStrictEqual(st, { '2001': 'Active', '2002': 'Closed', '2003': 'Active' });
+  const u = b.updates.filter(x => x.axoNumber === '2001')[0];
+  assert.strictEqual(u.status, 'Passed - Initial');
+  assert.strictEqual(u.qa, 'Norma');
+  assert.strictEqual(u.createdAt, '2026-11-10T02:00:00.000Z');
+  assert.strictEqual(plain(g.ctx.importEndorsementHistory()).updatesAdded, 0);
+});
+
+t('[Backend] AXOs close at Passed - Initial; closePassedAxos sweeps old ones', () => {
+  const g = loadGas();
+  addAxo(g, 'Axo Number: 3001 - [Backend] - API thing');
+  addAxo(g, 'Axo Number: 3002 - [Frontend] - UI thing');
+  addAxo(g, 'Axo Number: 3003 - [Backend] - Older thing');
+  const up = (num, status) => ({ axoNumber: num, qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status, notes: '', files: [] });
+  // simulate an old Passed - Initial on 3003 written before the rule existed
+  const sh = g.ss.getSheetByName('Updates') || g.ss.insertSheet('Updates');
+  g.ctx.apiAddUpdate(up('3003', 'In Progress'));
+  const rows = sh.dump(); rows[rows.length - 1][5] = 'Passed - Initial'; sh.getRange(rows.length, 6).setValue('Passed - Initial');
+  let b = plain(g.ctx.apiAddUpdate(up('3001', 'Passed - Initial')));
+  b = plain(g.ctx.apiAddUpdate(up('3002', 'Passed - Initial')));
+  let st = Object.fromEntries(b.axos.map(a => [a.axoNumber, a.state]));
+  assert.deepStrictEqual(st, { '3001': 'Closed', '3002': 'Active', '3003': 'Active' });
+  assert.deepStrictEqual(plain(g.ctx.closePassedAxos()), ['3003']);
+  st = Object.fromEntries(plain(g.ctx.apiBootstrap()).axos.map(a => [a.axoNumber, a.state]));
+  assert.strictEqual(st['3003'], 'Closed');
+});
+
+t('bootstrap gives a Slack thread base from auth.test', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1' } });
+  g.setFetch((url) => /auth.test/.test(url) ? { body: { ok: true, url: 'https://acme.slack.com/' } } : slackFake([])(url));
+  assert.strictEqual(g.ctx.apiBootstrap().slack.threadBase, 'https://acme.slack.com/archives/G1/p');
+});
+
+t('new AXOs from sync are posted to the notify webhook, backfill is not', () => {
+  const g = loadGas({ props: { SLACK_USER_TOKEN: 'x', SLACK_CHANNEL_ID: 'G1', SLACK_NOTIFY_WEBHOOK: 'https://hooks.slack.com/services/T/B/X' } });
+  const posts = [];
+  const now = (Date.now() / 1000).toFixed(6), old = (Date.now() / 1000 - 10 * 86400).toFixed(6);
+  g.setFetch((url, o) => {
+    if (/hooks.slack.com/.test(url)) { posts.push(JSON.parse(o.payload).text); return { code: 200, body: 'ok' }; }
+    if (/auth.test/.test(url)) return { body: { ok: true, url: 'https://acme.slack.com/' } };
+    return slackFake([{ ts: now, text: post(16001) }, { ts: old, text: post(16002) }])(url);
+  });
+  g.ctx.syncSlack();
+  assert.strictEqual(posts.length, 1);
+  assert.ok(/New AXO 16001/.test(posts[0]) && /HIGH/.test(posts[0]) && /archives\/G1\/p/.test(posts[0]));
+  g.props.SLACK_LAST_TS = '';
+  g.ctx.syncSlack(); // nothing new
+  g.ctx.backfillSlack(30);
+  assert.strictEqual(posts.length, 1);
+});
+
+t('bootstrap returns each QA\'s usual shift', () => {
+  const g = loadGas();
+  g.ctx.setupSheets();
+  const sh = g.ss.getSheetByName('QAs');
+  sh.getRange(2, 1, 3, 3).setValues([['Tessa', '', 'Night'], ['EJ', '', 'day'], ['Aaron', '', '']]);
+  assert.deepStrictEqual(plain(g.ctx.apiBootstrap().qaShifts), { Tessa: 'Night', EJ: 'Day' });
 });
 
 console.log(n + ' tests passed');

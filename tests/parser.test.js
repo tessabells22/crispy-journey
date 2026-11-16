@@ -110,4 +110,23 @@ t('workflow footer is not read as a field value', () => {
   assert.strictEqual(a.ticketNumber, '');
 });
 
+t('legacyUpdatesFrom maps endorsement rows to updates', () => {
+  const rows = [['e9', '2026-10-08', 'Mid', 'EJ', JSON.stringify({ sections: { workedOn: [{ axo: '#15242', status: 'Failed', note: 'n' }, { axo: 'NAZDAR', status: 'Blocked' }], notTested: [{ axo: '15263' }] } }), '2026-10-08T05:00:00Z', '']];
+  const u = P.legacyUpdatesFrom(rows).map(x => ({ ...x }));
+  assert.strictEqual(u.length, 2);
+  assert.strictEqual(u[0].id, 'legacy-e9-workedOn-0');
+  assert.strictEqual(u[0].axoNumber, '15242');
+  assert.strictEqual(u[0].status, 'Failed - Initial');
+  assert.strictEqual(u[1].status, 'Not Tested');
+  assert.strictEqual(u[1].updatedAt, '2026-10-08T05:00:00Z');
+});
+
+t('closesAxo: Backend closes at Passed - Initial, others at Develop/Deployment', () => {
+  assert.strictEqual(P.closesAxo('[Backend] - PRLA_V2: New EOD Close API', 'Passed - Initial'), true);
+  assert.strictEqual(P.closesAxo('[7139] [Back-end] - thing', 'Passed - Initial'), true);
+  assert.strictEqual(P.closesAxo('[Frontend] - Bug AXO: x', 'Passed - Initial'), false);
+  assert.strictEqual(P.closesAxo('[Frontend] - Bug AXO: x', 'Passed - Develop/Deployment'), true);
+  assert.strictEqual(P.closesAxo('[Backend] x', 'In Progress'), false);
+});
+
 console.log(n + ' tests passed');

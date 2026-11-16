@@ -30,7 +30,8 @@ function makeSheet(name) {
 
 function loadGas(opts = {}) {
   const sheets = {};
-  const props = Object.assign({}, opts.props || {});
+  const props = Object.assign({ SYNC_EVERY_MIN: '0' }, opts.props || {});
+  const external = opts.external || {};
   const cache = {};
   let fetchHandler = opts.fetch || (() => ({ code: 200, body: { ok: false, error: 'no_fetch_handler' } }));
   const ss = {
@@ -41,7 +42,8 @@ function loadGas(opts = {}) {
     console,
     JSON, Math, Date, Number, String, Object, Array, RegExp, Error, encodeURIComponent,
     module: undefined,
-    SpreadsheetApp: { getActive: () => ss, getUi: () => ({ createMenu: () => ({ addItem() { return this; }, addToUi() {} }) }) },
+    SpreadsheetApp: { getActive: () => ss,
+      openById: (id) => ({ getSheetByName: (n) => (external[id] && external[id][n]) ? { getDataRange: () => ({ getValues: () => external[id][n].map(r => r.slice()) }) } : null }), getUi: () => ({ createMenu: () => ({ addItem() { return this; }, addToUi() {} }) }) },
     PropertiesService: { getScriptProperties: () => ({
       getProperty: (k) => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); } }) },
     LockService: { getScriptLock: () => ({ waitLock() {}, tryLock: () => true, releaseLock() {} }) },
