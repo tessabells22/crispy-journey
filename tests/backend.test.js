@@ -3,6 +3,7 @@ const assert = require('assert');
 const { loadGas } = require('./fake-gas');
 
 let n = 0;
+function addAxo(g, text) { return plain(g.ctx.upsertAxos_([g.ctx.parseAxoPost(text)], 'slack')); }
 function t(name, fn) { fn(); n++; console.log('ok -', name); }
 const plain = (x) => JSON.parse(JSON.stringify(x));
 
@@ -48,22 +49,27 @@ t('sync errors are recorded, not thrown', () => {
   assert.match(plain(g.ctx.apiBootstrap()).slack.lastError.error, /not_in_channel/);
 });
 
-t('paste adds once and merges blanks without duplicating', () => {
+t('a repeat post merges blanks without duplicating', () => {
   const g = loadGas();
-  const r1 = plain(g.ctx.apiPasteAxo('Axo Number: 15700 - Bug AXO: Paste me\nPriority: Low'));
-  assert.ok(r1.added);
-  const r2 = plain(g.ctx.apiPasteAxo('Axo Number: 15700 - Bug AXO: Paste me\nClient: Globex'));
-  assert.ok(r2.updated && !r2.added);
+  const r1 = addAxo(g, 'Axo Number: 15700 - Bug AXO: Repeat me\nPriority: Low');
+  assert.strictEqual(r1.added.length, 1);
+  const r2 = addAxo(g, 'Axo Number: 15700 - Bug AXO: Repeat me\nClient: Globex');
+  assert.ok(r2.updated.length === 1 && !r2.added.length);
   const axos = plain(g.ctx.apiBootstrap()).axos;
   assert.strictEqual(axos.length, 1);
   assert.strictEqual(axos[0].priority, 'Low');
   assert.strictEqual(axos[0].client, 'Globex');
-  assert.throws(() => g.ctx.apiPasteAxo('no number here'), /No AXO number/);
+});
+
+t('Paste AXO is removed from the server API', () => {
+  const g = loadGas();
+  assert.strictEqual(typeof g.ctx.apiPasteAxo, 'undefined');
+  assert.strictEqual(typeof g.ctx.apiParseAxo, 'undefined');
 });
 
 t('updates: validate, keep history, auto-close, reopen, edit, delete', () => {
   const g = loadGas();
-  g.ctx.apiPasteAxo('Axo Number: 15800 - Bug AXO: Close me');
+  addAxo(g, 'Axo Number: 15800 - Bug AXO: Close me');
   const base = { axoNumber: '15800', qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status: 'In Progress', notes: 'started', files: [{ name: 'TC', url: 'https://drive.google.com/x' }, { name: 'bad', url: 'javascript:alert(1)' }] };
   assert.throws(() => g.ctx.apiAddUpdate(Object.assign({}, base, { status: 'Nope' })), /status/);
   assert.throws(() => g.ctx.apiAddUpdate(Object.assign({}, base, { axoNumber: '1' })), /not in the tracker/);
@@ -94,9 +100,9 @@ t('re-sync never reopens a closed AXO', () => {
 
 t('closeImportedAxos closes overdue untouched AXOs only', () => {
   const g = loadGas();
-  g.ctx.apiPasteAxo('Axo Number: 1001 - Old\nDue Date: 2020-01-01');
-  g.ctx.apiPasteAxo('Axo Number: 1002 - Old but worked\nDue Date: 2020-01-01');
-  g.ctx.apiPasteAxo('Axo Number: 1003 - Future\nDue Date: 2099-01-01');
+  addAxo(g, 'Axo Number: 1001 - Old\nDue Date: 2020-01-01');
+  addAxo(g, 'Axo Number: 1002 - Old but worked\nDue Date: 2020-01-01');
+  addAxo(g, 'Axo Number: 1003 - Future\nDue Date: 2099-01-01');
   g.ctx.apiAddUpdate({ axoNumber: '1002', qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status: 'In Progress', notes: '', files: [] });
   assert.strictEqual(g.ctx.closeImportedAxos('2026-11-14'), 1);
   const st = Object.fromEntries(plain(g.ctx.apiBootstrap()).axos.map(a => [a.axoNumber, a.state]));
@@ -123,7 +129,7 @@ t('importEndorsementHistory copies old AXO lines, re-runs safely, fixes open/clo
     row('e1', '2026-11-10', 'Day', 'Norma', { workedOn: [{ axo: '2001', status: 'Passed', note: 'ok' }, { axo: '9999', status: 'In Progress' }], nonAxo: [{ note: 'x' }] }, '2026-11-10T02:00:00.000Z'),
     row('e2', '2026-11-11', 'Night', 'Ervin', { workedOn: [{ axo: '2002 (formerly 1)', status: 'Passed - Develop/Deployment', note: '' }], blocker: [{ axo: '2003', status: 'Blocked', note: 'env down' }] }, '2026-11-11T15:00:00.000Z')
   ] } } });
-  ['2001', '2002', '2003'].forEach(nm => g.ctx.apiPasteAxo('Axo Number: ' + nm + ' - T\nDue Date: 2020-01-01'));
+  ['2001', '2002', '2003'].forEach(nm => addAxo(g, 'Axo Number: ' + nm + ' - T\nDue Date: 2020-01-01'));
   g.ctx.apiSetAxoState('2003', 'Closed'); // e.g. auto-closed as overdue
   const r = plain(g.ctx.importEndorsementHistory());
   assert.strictEqual(r.updatesAdded, 3);
@@ -142,9 +148,9 @@ t('importEndorsementHistory copies old AXO lines, re-runs safely, fixes open/clo
 
 t('[Backend] AXOs close at Passed - Initial; closePassedAxos sweeps old ones', () => {
   const g = loadGas();
-  g.ctx.apiPasteAxo('Axo Number: 3001 - [Backend] - API thing');
-  g.ctx.apiPasteAxo('Axo Number: 3002 - [Frontend] - UI thing');
-  g.ctx.apiPasteAxo('Axo Number: 3003 - [Backend] - Older thing');
+  addAxo(g, 'Axo Number: 3001 - [Backend] - API thing');
+  addAxo(g, 'Axo Number: 3002 - [Frontend] - UI thing');
+  addAxo(g, 'Axo Number: 3003 - [Backend] - Older thing');
   const up = (num, status) => ({ axoNumber: num, qa: 'Ley', shiftDate: '2026-11-13', shift: 'Day', status, notes: '', files: [] });
   // simulate an old Passed - Initial on 3003 written before the rule existed
   const sh = g.ss.getSheetByName('Updates') || g.ss.insertSheet('Updates');
@@ -181,8 +187,6 @@ t('new AXOs from sync are posted to the notify webhook, backfill is not', () => 
   g.ctx.syncSlack(); // nothing new
   g.ctx.backfillSlack(30);
   assert.strictEqual(posts.length, 1);
-  g.ctx.apiPasteAxo('Axo Number: 16003 - [Backend] - Pasted');
-  assert.strictEqual(posts.length, 2);
 });
 
 t('bootstrap returns each QA\'s usual shift', () => {

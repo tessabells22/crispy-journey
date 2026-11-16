@@ -202,7 +202,7 @@
     }).join('');
 
     var sl = S.data.slack, sync = $('sync'), txt, cls = 'sync';
-    if (!sl.configured) { txt = 'Slack not connected'; cls += ' err'; sync.title = 'Use Paste AXO to add AXOs'; }
+    if (!sl.configured) { txt = 'Slack not connected'; cls += ' err'; sync.title = 'Slack sync is not set up'; }
     else if (sl.lastError && sl.lastError.at && (!sl.lastSync.at || sl.lastError.at > sl.lastSync.at)) {
       txt = 'Slack sync failed ' + ago(sl.lastError.at); cls += ' err can'; sync.title = (sl.lastError.error || '') + ' · click to retry';
     } else { txt = sl.lastSync.at ? 'Synced ' + ago(sl.lastSync.at) : 'Waiting for first sync'; cls += ' can'; sync.title = 'Click to sync now'; }
@@ -307,7 +307,7 @@
     $('board-title').innerHTML = esc(qd.label) + (S.qa ? ' <small>worked by ' + esc(S.qa) + ' · <button class="linkish" type="button" id="clear-qa">clear</button></small>' : '');
     if (!list.length) {
       var msg = !all().length
-        ? (S.data.slack.configured ? '<b>No AXOs yet</b>They show up here after the next Slack sync.' : '<b>No AXOs yet</b>Use Paste AXO to add one from Slack.')
+        ? (S.data.slack.configured ? '<b>No AXOs yet</b>They show up here after the next Slack sync.' : '<b>No AXOs yet</b>Slack sync is not set up yet.')
         : S.queue === 'needs' && !$('f-q').value && !S.qa ? '<b>All caught up</b>Every active AXO has at least one QA update.'
         : '<b>Nothing here</b>No AXOs match this queue and these filters.';
       $('cards').innerHTML = '<div class="empty">' + msg + '</div>';
@@ -620,7 +620,7 @@
         : esc(a.dueDateRaw || '—')],
       ['Ticket', esc(a.ticketNumber || '—')],
       ['Posted', a.postedAt ? esc(new Date(a.postedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })) : '—'],
-      ['Added from', a.source === 'paste' ? 'Paste AXO' : 'Slack sync']
+      ['Added from', a.source === 'paste' ? 'Pasted by hand' : 'Slack sync']
     ];
     if (a.closed && a.closedAt) facts.push(['Closed', esc(new Date(a.closedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }))]);
 
@@ -698,46 +698,13 @@
     return false;
   }
 
-  /* ---------- pick + paste dialogs ---------- */
+  /* ---------- pick dialog ---------- */
   function openPick() {
     $('axo-options').innerHTML = all().filter(function (a) { return !a.closed; })
       .sort(function (x, y) { return Number(y.axoNumber) - Number(x.axoNumber); })
       .map(function (a) { return '<option value="' + esc(a.axoNumber + ' - ' + (a.title || '')) + '"></option>'; }).join('');
     $('pick-axo').value = ''; $('pick-err').hidden = true;
     $('pick-dlg').showModal(); $('pick-axo').focus();
-  }
-  function openPaste() {
-    $('paste-text').value = ''; $('paste-preview').hidden = true; $('paste-err').hidden = true; $('paste-save').disabled = true;
-    $('paste-dlg').showModal(); $('paste-text').focus();
-  }
-  function checkPaste() {
-    var text = $('paste-text').value;
-    $('paste-err').hidden = true;
-    if (!text.trim()) return;
-    call('apiParseAxo', text).then(function (a) {
-      if (!a) {
-        $('paste-err').textContent = 'No AXO number found. Paste the whole Slack post, starting from "Axo Number".';
-        $('paste-err').hidden = false; $('paste-preview').hidden = true; $('paste-save').disabled = true; return;
-      }
-      var exists = S.byNum[a.axoNumber];
-      var rows = [['AXO', a.axoNumber], ['Title', a.title], ['Priority', a.priority], ['Link', a.link],
-        ['Due date', a.dueDate ? fmtDay(a.dueDate, true) : a.dueDateRaw], ['Client', a.client], ['Ticket', a.ticketNumber],
-        ['Raised by', a.raisedBy], ['Dev', a.devAssignees.join(', ')]];
-      $('paste-preview').innerHTML = (exists ? '<div class="tip" style="margin:0 0 10px"><b>Already in the tracker.</b> Saving fills in any blanks and won\'t create a duplicate.</div>' : '') +
-        '<dl class="facts">' + rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1] || '—') + '</dd>'; }).join('') + '</dl>';
-      $('paste-preview').hidden = false;
-      $('paste-save').disabled = false;
-      $('paste-save').textContent = exists ? 'Update AXO' : 'Add AXO';
-    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; });
-  }
-  function savePaste(ev) {
-    ev.preventDefault();
-    $('paste-save').disabled = true;
-    call('apiPasteAxo', $('paste-text').value).then(function (r) {
-      $('paste-dlg').close();
-      toast(r.added ? 'AXO ' + r.axo.axoNumber + ' added.' : r.updated ? 'AXO ' + r.axo.axoNumber + ' updated.' : 'AXO ' + r.axo.axoNumber + ' was already up to date.');
-      return refresh().then(function () { openDetail(r.axo.axoNumber); });
-    }, function (e) { $('paste-err').textContent = e.message; $('paste-err').hidden = false; $('paste-save').disabled = false; });
   }
 
   /* ---------- render + data ---------- */
@@ -773,10 +740,9 @@
     $('me-select').onchange = function () { store('npdqa.me', this.value); S.composerFor = ''; render(); };
     $('help-btn').onclick = function () { $('help-dlg').showModal(); };
     $('help-close').onclick = function () { $('help-dlg').close(); };
-    $('paste-btn').onclick = openPaste;
     $('add-btn').onclick = function () { if (requireMe()) openPick(); };
     $('sync').onclick = function () {
-      if (!S.data || !S.data.slack.configured) { toast('Slack sync is not set up. Use Paste AXO to add AXOs.'); return; }
+      if (!S.data || !S.data.slack.configured) { toast('Slack sync is not set up.'); return; }
       $('sync').className = 'sync busy'; $('sync-text').textContent = 'Syncing…';
       call('apiSyncNow').then(function (d) { S.data = d; render(); toast('Slack sync done.'); }, function (e) { toast(e.message, true); render(); });
     };
@@ -859,10 +825,6 @@
       $('pick-dlg').close(); openDetail(m[0], true);
     });
     $('pick-cancel').onclick = function () { $('pick-dlg').close(); };
-    $('paste-form').addEventListener('submit', savePaste);
-    $('paste-cancel').onclick = function () { $('paste-dlg').close(); };
-    $('paste-check').onclick = checkPaste;
-    $('paste-text').addEventListener('paste', function () { setTimeout(checkPaste, 0); });
 
     // New AXOs arrive from Slack: refresh every 2 minutes while the tab is visible.
     setInterval(function () {

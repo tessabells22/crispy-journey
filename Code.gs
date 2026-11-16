@@ -9,9 +9,8 @@
      • Updates  — one row per QA update on an AXO (history kept)
      • QAs      — the QA name list for the "Who are you?" picker
 
-   Ingestion (both paths go through Parser.gs → upsertAxos_):
+   Ingestion (through Parser.gs → upsertAxos_):
      • syncSlack()    — time trigger, Slack conversations.history
-     • apiPasteAxo()  — "Paste AXO" box in the web app
 
    Script Properties (Project Settings > Script Properties):
      • SLACK_USER_TOKEN   xoxp-… user token (scopes: groups:history,
@@ -22,7 +21,7 @@
      • SLACK_LAST_TS      auto-managed; clear it to re-scan
    ============================================================ */
 
-var BUILD = '2026-11-14.4';
+var BUILD = '2026-11-16.1';
 var TZ = 'Asia/Manila';
 
 var AXO_SHEET = 'AXOs';
@@ -356,7 +355,7 @@ function notifyNewAxos_(numbers) {
   var want = {}; numbers.forEach(function (n) { want[n] = true; });
   var dayAgo = new Date(Date.now() - 864e5).toISOString();
   var rows = readRows_(AXO_SHEET, AXO_HEADERS).filter(function (r) {
-    return want[r.AxoNumber] && (r.Source === 'paste' || String(r.PostedAt || r.CreatedAt) >= dayAgo);
+    return want[r.AxoNumber] && String(r.PostedAt || r.CreatedAt) >= dayAgo;
   });
   if (!rows.length) return 0;
   var trackerUrl = '';
@@ -621,23 +620,9 @@ function apiBootstrap() {
   };
 }
 
-/* Preview what a paste will add, without saving. */
-function apiParseAxo(text) {
-  return parseAxoPost(String(text || '').slice(0, 20000));
-}
-
-/* Paste AXO fallback: same parser as the Slack sync. */
-function apiPasteAxo(text) {
-  var axo = parseAxoPost(String(text || '').slice(0, 20000));
-  if (!axo) throw new Error('No AXO number found. Paste the whole Slack post, starting from "Axo Number".');
-  var r = upsertAxos_([axo], 'paste');
-  notifyNewAxos_(r.added);
-  return { axo: axo, added: r.added.length > 0, updated: r.updated.length > 0 };
-}
-
 /* Let a QA pull the newest posts now instead of waiting for the trigger. */
 function apiSyncNow() {
-  if (!prop_('SLACK_USER_TOKEN')) throw new Error('Slack sync is not set up yet. Use Paste AXO instead.');
+  if (!prop_('SLACK_USER_TOKEN')) throw new Error('Slack sync is not set up yet.');
   syncSlack();
   return apiBootstrap();
 }

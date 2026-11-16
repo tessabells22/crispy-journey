@@ -3,7 +3,7 @@
    ------------------------------------------------------------
    ONE parser for both ingestion paths:
      • Slack sync  — message text from conversations.history
-     • Paste AXO   — text a QA lead copies out of the Slack client
+     • Copied text — a Slack post pasted into a test or the editor
    No Apps Script services are used here, so the file also runs
    under Node for tests (see tests/parser.test.js).
    ============================================================ */

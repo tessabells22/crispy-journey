@@ -2,8 +2,7 @@
 
 A Google Apps Script web app where NPD QAs log their updates on AXOs. QAs don't add AXOs:
 new ones come in by themselves from the **#axo-assignments** Slack channel (posted by the
-"NPD Axo Assignment" workflow). If Slack sync isn't set up, anyone can add an AXO with
-**Paste AXO**, which reads a copied Slack post with the same parser.
+"NPD Axo Assignment" workflow).
 
 This is a separate project from the NPD QA Endorsement Tracker. It has its own Sheet,
 its own Apps Script project and its own deployment, and shares nothing with it. It uses the
@@ -30,7 +29,7 @@ Failed - Initial, Failed - Develop/Deployment, Needs Monitoring, Urgent/High Pri
 | File | What it is |
 |---|---|
 | `Code.gs` | Server: Sheet storage, Slack sync, web app API |
-| `Parser.gs` | The one AXO parser used by both Slack sync and Paste AXO |
+| `Parser.gs` | The AXO parser used by the Slack sync |
 | `Index.html`, `Styles.html`, `Script.html` | The web app page |
 | `appsscript.json` | Manifest (time zone, scopes, web app access) |
 | `tests/`, `tools/` | Local tests and preview. Not uploaded to Apps Script |
@@ -47,7 +46,7 @@ Failed - Initial, Failed - Develop/Deployment, Needs Monitoring, Urgent/High Pri
 6. Reload the Sheet. An **AXO Tracker** menu appears. Run **AXO Tracker > Set up tabs** and approve the permissions.
 7. In the **QAs** tab, list the QA names in column A (one per row). Put `FALSE` in column B to hide someone who left. Column C (`Shift`) is the QA's usual shift (Day, Mid or Night); the update form starts on that shift.
 
-### 2. Slack sync (skip if you can't install a Slack app; Paste AXO still works)
+### 2. Slack sync (required: it is the only way AXOs get in)
 
 The sync reads #axo-assignments as **you**, using a Slack user token. No bot joins the
 channel and the workflow is not changed.
@@ -109,11 +108,11 @@ Ticket Number: …
 Labels can be bold, have or lack a colon, and sit on the same line as the value or the line
 above it. Additional Info can run over several lines. A reply like
 `@Dev assigned to Axo 15611 - …` sets the dev assignee. AXOs are de-duplicated by number:
-a repeat post or paste only fills in blank fields and never creates a second row or reopens
+a repeat post only fills in blank fields and never creates a second row or reopens
 a closed AXO.
 
-If the real workflow output differs from this, paste a sample into Paste AXO and press
-**Check** to see what gets picked up, then adjust the label list at the top of `Parser.gs`.
+If the real workflow output differs from this, add a sample to `tests/parser.test.js`,
+see what gets picked up, then adjust the label list at the top of `Parser.gs`.
 
 ## Sheet tabs
 
